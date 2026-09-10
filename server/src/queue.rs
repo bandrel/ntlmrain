@@ -50,6 +50,40 @@ const QUEUE_TIMEOUT_SECS: i64 = 1800;
 /// `running` row instead of requeuing it again.
 const MAX_RESTART_ATTEMPTS: i64 = 2;
 
+/// Schema DDL shared by every way of constructing a `SubmissionStore`
+/// (on-disk `open()` and, in tests, `open_in_memory()`), so the two paths
+/// can never drift out of sync with each other. `IF NOT EXISTS`/`OR
+/// IGNORE` throughout so it's also safe to run against an existing
+/// on-disk database on every startup.
+const SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS submissions (
+        token_sha256      BLOB PRIMARY KEY,
+        queue_seq         INTEGER NOT NULL,
+        state             TEXT NOT NULL,
+        record_count      INTEGER NOT NULL,
+        processed_records INTEGER NOT NULL DEFAULT 0,
+        match_count       INTEGER,
+        error             TEXT,
+        input_path        TEXT NOT NULL,
+        result_path       TEXT,
+        attempts          INTEGER NOT NULL DEFAULT 0,
+        created_at        INTEGER NOT NULL,
+        started_at        INTEGER,
+        finished_at       INTEGER,
+        result_expires_at INTEGER,
+        input_cleaned     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_submissions_queue_seq
+        ON submissions(queue_seq);
+    CREATE INDEX IF NOT EXISTS idx_submissions_state
+        ON submissions(state);
+    CREATE TABLE IF NOT EXISTS queue_counter (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        next_seq INTEGER NOT NULL
+    );
+    INSERT OR IGNORE INTO queue_counter (id, next_seq) VALUES (0, 1);
+";
+
 #[derive(Debug, Error)]
 pub enum QueueError {
     #[error("sqlite error: {0}")]
@@ -206,79 +240,34 @@ pub struct SubmissionStore {
 }
 
 impl SubmissionStore {
-    /// Open (creating if necessary) the queue database at `path`, enable
-    /// WAL mode, and ensure the schema exists.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path.as_ref())?;
+    /// Shared construction path for every way of getting a
+    /// `SubmissionStore`: enables WAL mode and runs [`SCHEMA_SQL`] against
+    /// `conn`. Both `open()` and `open_in_memory()` funnel through this so
+    /// the schema can never drift between the on-disk and in-memory (test)
+    /// paths.
+    fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS submissions (
-                token_sha256      BLOB PRIMARY KEY,
-                queue_seq         INTEGER NOT NULL,
-                state             TEXT NOT NULL,
-                record_count      INTEGER NOT NULL,
-                processed_records INTEGER NOT NULL DEFAULT 0,
-                match_count       INTEGER,
-                error             TEXT,
-                input_path        TEXT NOT NULL,
-                result_path       TEXT,
-                attempts          INTEGER NOT NULL DEFAULT 0,
-                created_at        INTEGER NOT NULL,
-                started_at        INTEGER,
-                finished_at       INTEGER,
-                result_expires_at INTEGER,
-                input_cleaned     INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_submissions_queue_seq
-                ON submissions(queue_seq);
-            CREATE INDEX IF NOT EXISTS idx_submissions_state
-                ON submissions(state);
-            CREATE TABLE IF NOT EXISTS queue_counter (
-                id INTEGER PRIMARY KEY CHECK (id = 0),
-                next_seq INTEGER NOT NULL
-            );
-            INSERT OR IGNORE INTO queue_counter (id, next_seq) VALUES (0, 1);",
-        )?;
+        conn.execute_batch(SCHEMA_SQL)?;
         Ok(SubmissionStore {
             conn: Mutex::new(conn),
         })
     }
 
+    /// Open (creating if necessary) the queue database at `path`, enable
+    /// WAL mode, and ensure the schema exists.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(path.as_ref())?;
+        Self::init(conn)
+    }
+
     /// Open an in-memory database. Only used by this module's own tests
     /// (`tempfile::tempdir()` is used for the "on disk" behavior instead
-    /// where the test cares about the file existing).
+    /// where the test cares about the file existing). WAL mode is a no-op
+    /// on `:memory:` databases but harmless to request.
     #[cfg(test)]
     fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE submissions (
-                token_sha256      BLOB PRIMARY KEY,
-                queue_seq         INTEGER NOT NULL,
-                state             TEXT NOT NULL,
-                record_count      INTEGER NOT NULL,
-                processed_records INTEGER NOT NULL DEFAULT 0,
-                match_count       INTEGER,
-                error             TEXT,
-                input_path        TEXT NOT NULL,
-                result_path       TEXT,
-                attempts          INTEGER NOT NULL DEFAULT 0,
-                created_at        INTEGER NOT NULL,
-                started_at        INTEGER,
-                finished_at       INTEGER,
-                result_expires_at INTEGER,
-                input_cleaned     INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX idx_submissions_queue_seq ON submissions(queue_seq);
-            CREATE INDEX idx_submissions_state ON submissions(state);
-            CREATE TABLE queue_counter (
-                id INTEGER PRIMARY KEY CHECK (id = 0),
-                next_seq INTEGER NOT NULL
-            );
-            INSERT INTO queue_counter (id, next_seq) VALUES (0, 1);",
-        )?;
-        Ok(SubmissionStore {
-            conn: Mutex::new(conn),
-        })
+        Self::init(conn)
     }
 
     /// Insert a new `queued` submission, unless the number of
@@ -291,7 +280,7 @@ impl SubmissionStore {
         max_queued: usize,
         slots: usize,
     ) -> Result<InsertOutcome> {
-        let mut conn = self.conn.lock().expect("queue mutex poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
 
         let in_flight: i64 = tx.query_row(
@@ -335,7 +324,7 @@ impl SubmissionStore {
     /// Atomically claim the lowest-`queue_seq` `queued` row, transitioning
     /// it to `running`.
     pub fn claim_next_queued(&self) -> Result<Option<ClaimedJob>> {
-        let mut conn = self.conn.lock().expect("queue mutex poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
 
         let candidate = tx
@@ -377,7 +366,7 @@ impl SubmissionStore {
         token_sha256: TokenHash,
         processed_records: u64,
     ) -> Result<()> {
-        let conn = self.conn.lock().expect("queue mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE submissions SET processed_records = ?2 WHERE token_sha256 = ?1",
             params![token_sha256.as_slice(), processed_records as i64],
@@ -385,19 +374,25 @@ impl SubmissionStore {
         Ok(())
     }
 
+    /// Transition a `running` row to `ready`. Guarded to `state =
+    /// 'running'` so a `mark_ready` racing after the row already left
+    /// `running` (e.g. a concurrent `mark_cancelled`) is a no-op instead
+    /// of clobbering whatever terminal state won the race. Returns `true`
+    /// if a row was actually transitioned, `false` if the token is
+    /// unknown or the row wasn't `running` anymore.
     pub fn mark_ready(
         &self,
         token_sha256: TokenHash,
         match_count: u64,
         result_path: &str,
-    ) -> Result<()> {
-        let conn = self.conn.lock().expect("queue mutex poisoned");
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_unix();
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE submissions
              SET state = 'ready', match_count = ?2, result_path = ?3,
                  finished_at = ?4, result_expires_at = ?5
-             WHERE token_sha256 = ?1",
+             WHERE token_sha256 = ?1 AND state = 'running'",
             params![
                 token_sha256.as_slice(),
                 match_count as i64,
@@ -406,32 +401,46 @@ impl SubmissionStore {
                 now + RESULT_TTL_SECS,
             ],
         )?;
-        Ok(())
+        Ok(affected > 0)
     }
 
-    pub fn mark_failed(&self, token_sha256: TokenHash, error: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("queue mutex poisoned");
-        conn.execute(
+    /// Transition a `queued`/`running` row to `failed`. Guarded so a
+    /// `mark_failed` racing after the row already reached a terminal
+    /// state (e.g. `mark_ready` already won, or a stale-queue `reap`
+    /// already failed it) is a no-op. Returns `true` if a row was
+    /// actually transitioned.
+    pub fn mark_failed(&self, token_sha256: TokenHash, error: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let affected = conn.execute(
             "UPDATE submissions SET state = 'failed', error = ?2, finished_at = ?3
-             WHERE token_sha256 = ?1",
+             WHERE token_sha256 = ?1 AND state IN ('queued', 'running')",
             params![token_sha256.as_slice(), error, now_unix()],
         )?;
-        Ok(())
+        Ok(affected > 0)
     }
 
-    pub fn mark_cancelled(&self, token_sha256: TokenHash) -> Result<()> {
-        let conn = self.conn.lock().expect("queue mutex poisoned");
-        conn.execute(
+    /// Transition a `queued`/`running` row to `cancelled`. Guarded so a
+    /// cancel landing after the worker already finished (a realistic
+    /// race: the row went `ready` between the handler's `get` and its
+    /// `mark_cancelled` call) is a no-op rather than overwriting a
+    /// `ready` row's `result_path` with `cancelled` and orphaning the
+    /// result file on disk. Returns `true` if a row was actually
+    /// transitioned, `false` if the token is unknown or the row was
+    /// already terminal (so the caller can distinguish "cancelled" from
+    /// "too late" without a separate TOCTOU `get`).
+    pub fn mark_cancelled(&self, token_sha256: TokenHash) -> Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let affected = conn.execute(
             "UPDATE submissions SET state = 'cancelled', finished_at = ?2
-             WHERE token_sha256 = ?1",
+             WHERE token_sha256 = ?1 AND state IN ('queued', 'running')",
             params![token_sha256.as_slice(), now_unix()],
         )?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Full row for the status/result/cancel handlers.
     pub fn get(&self, token_sha256: TokenHash) -> Result<Option<SubmissionRow>> {
-        let conn = self.conn.lock().expect("queue mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let row = conn
             .query_row(
                 "SELECT * FROM submissions WHERE token_sha256 = ?1",
@@ -447,7 +456,7 @@ impl SubmissionStore {
     /// when to use it (returns `Some` regardless of the row's current
     /// state, as long as the row exists).
     pub fn queue_position(&self, token_sha256: TokenHash) -> Result<Option<u64>> {
-        let conn = self.conn.lock().expect("queue mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let seq: Option<i64> = conn
             .query_row(
                 "SELECT queue_seq FROM submissions WHERE token_sha256 = ?1",
@@ -472,7 +481,7 @@ impl SubmissionStore {
     /// were requeued (post-transition state) so `main.rs` can re-enqueue
     /// their tokens with the worker pool's dispatch mechanism if needed.
     pub fn restart_sweep(&self) -> Result<Vec<SubmissionRow>> {
-        let mut conn = self.conn.lock().expect("queue mutex poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let now = now_unix();
 
@@ -523,7 +532,7 @@ impl SubmissionStore {
     /// `queue.rs` never touches the filesystem itself; the caller acts on
     /// the returned paths.
     pub fn reap(&self, now: i64) -> Result<ReapReport> {
-        let mut conn = self.conn.lock().expect("queue mutex poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
 
         // (b) Stale `queued` rows time out first, so they're picked up by
@@ -701,10 +710,51 @@ mod tests {
     fn mark_cancelled_sets_terminal_fields() {
         let store = SubmissionStore::open_in_memory().expect("open");
         store.insert(token(1), 100, "/in1", 8, 8).unwrap();
-        store.mark_cancelled(token(1)).unwrap();
+        assert!(store.mark_cancelled(token(1)).unwrap());
         let row = store.get(token(1)).unwrap().expect("row");
         assert_eq!(row.state, SubmissionState::Cancelled);
         assert!(row.finished_at.is_some());
+    }
+
+    #[test]
+    fn mark_ready_mark_failed_mark_cancelled_report_whether_they_actually_transitioned() {
+        let store = SubmissionStore::open_in_memory().expect("open");
+        store.insert(token(1), 1, "/in1", 8, 8).unwrap();
+        store.claim_next_queued().unwrap();
+        assert!(store.mark_ready(token(1), 1, "/out1").unwrap());
+
+        // Row is already `ready` (terminal) now: further mark_* calls on
+        // it must no-op and report false, not silently "succeed".
+        assert!(!store.mark_ready(token(1), 2, "/out2").unwrap());
+        assert!(!store.mark_failed(token(1), "too late").unwrap());
+        assert!(!store.mark_cancelled(token(1)).unwrap());
+
+        // An unknown token also reports false rather than a silent
+        // no-op success.
+        assert!(!store.mark_ready(token(99), 1, "/out99").unwrap());
+        assert!(!store.mark_failed(token(99), "boom").unwrap());
+        assert!(!store.mark_cancelled(token(99)).unwrap());
+    }
+
+    #[test]
+    fn mark_cancelled_after_mark_ready_does_not_clobber_the_ready_row() {
+        // Regression test for the race where a cancel request lands after
+        // the worker already finished (between the handler's `get` and
+        // its `mark_cancelled` call): the row must stay `ready` with its
+        // `result_path` intact, not flip to `cancelled` and orphan the
+        // result file on disk.
+        let store = SubmissionStore::open_in_memory().expect("open");
+        store.insert(token(1), 1, "/in1", 8, 8).unwrap();
+        store.claim_next_queued().unwrap();
+        assert!(store.mark_ready(token(1), 3, "/out1").unwrap());
+
+        let cancelled = store.mark_cancelled(token(1)).unwrap();
+        assert!(!cancelled);
+
+        let row = store.get(token(1)).unwrap().expect("row");
+        assert_eq!(row.state, SubmissionState::Ready);
+        assert_eq!(row.match_count, Some(3));
+        assert_eq!(row.result_path.as_deref(), Some("/out1"));
     }
 
     #[test]
