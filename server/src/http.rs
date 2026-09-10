@@ -24,9 +24,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
-use ntlmrain::local_lookup::parse_endpoint_file;
+use ntlmrain::local_lookup::{TableInfo, parse_endpoint_file};
 
 use crate::auth::{self, AuthState};
 use crate::config::Config;
@@ -125,6 +126,7 @@ pub struct AppState {
     workers: WorkerPoolHandle,
     upload_semaphore: Arc<Semaphore>,
     ready: Arc<AtomicBool>,
+    table_info: Option<Arc<TableInfo>>,
 }
 
 /// Build the full `axum::Router`.
@@ -132,6 +134,14 @@ pub struct AppState {
 /// `ready` gates `/health/ready`: `200` once it's `true`, `503` otherwise.
 /// Task 5 flips it to `true` once `LocalTable::open` succeeds; this task's
 /// own tests default it to `true` (an `Arc::new(AtomicBool::new(true))`).
+///
+/// `table_info` is a snapshot of `LocalTable::info()` (plan section 8:
+/// "`/health/ready` reports `TableInfo`"), taken once at startup right
+/// after the table opens -- `TableInfo` is `Clone` and doesn't change over
+/// the table's lifetime, so no interior mutability is needed here. `None`
+/// when there's no real table backing this router (e.g. this module's own
+/// tests, which run against `FakeBackend`); `health_ready` reports the
+/// bare `{"status": "ready"}` body in that case.
 ///
 /// A `--static-dir`-gated fallback and a `/shaders/*` route are Phase 2
 /// hooks (plan section 9) reserved but not implemented: `Config` already
@@ -141,6 +151,7 @@ pub fn build_router(
     store: Arc<SubmissionStore>,
     workers: WorkerPoolHandle,
     ready: Arc<AtomicBool>,
+    table_info: Option<Arc<TableInfo>>,
 ) -> anyhow::Result<Router> {
     let auth_state = AuthState::from_config(&config)?;
     let upload_semaphore = Arc::new(Semaphore::new(config.max_concurrent_uploads));
@@ -150,6 +161,7 @@ pub fn build_router(
         workers,
         upload_semaphore,
         ready,
+        table_info,
     };
 
     // Built as its own `Router` (rather than a `MethodRouter::layer` chain
@@ -205,7 +217,14 @@ pub fn build_router(
     let router = Router::new()
         .merge(submissions_router)
         .merge(public_router)
-        .layer(CatchPanicLayer::custom(handle_panic));
+        .layer(CatchPanicLayer::custom(handle_panic))
+        // Phase 2 stub (plan section 9): the browser UI isn't mounted yet,
+        // but every response already carries a minimal same-origin CSP so
+        // there's nothing to retrofit once it lands.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'self'"),
+        ));
 
     Ok(router)
 }
@@ -308,16 +327,23 @@ async fn submit_handler(State(state): State<AppState>, body: Bytes) -> Result<Re
         })?;
 
     let input_path = final_path.to_string_lossy().into_owned();
-    let outcome = state
-        .store
-        .insert(
-            token_sha256,
-            record_count,
-            &input_path,
-            state.config.max_queued,
-            state.config.lookup_slots,
-        )
-        .map_err(|error| ApiError::internal(format!("queue store error: {error}")))?;
+    let outcome = match state.store.insert(
+        token_sha256,
+        record_count,
+        &input_path,
+        state.config.max_queued,
+        state.config.lookup_slots,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The blob is already renamed into place at this point, but no
+            // row exists to reference it (the insert itself failed), so it
+            // would otherwise leak on disk forever -- same reasoning as the
+            // `QueueFull` arm below, just for a different failure mode.
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(ApiError::internal(format!("queue store error: {error}")));
+        }
+    };
 
     match outcome {
         InsertOutcome::Inserted { .. } => Ok((
@@ -508,11 +534,21 @@ async fn health_live() -> impl IntoResponse {
 
 async fn health_ready(State(state): State<AppState>) -> Response {
     if state.ready.load(Ordering::Acquire) {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "ready" })),
-        )
-            .into_response()
+        // Plan section 8: "/health/ready reports TableInfo (records,
+        // blocks, parts, min/max endpoint)". `table_info` is `None` only
+        // when there's no real table backing this router (this module's
+        // own tests); production always has one by the time `ready` is
+        // ever `true` (see `lib.rs::build_app`, which opens the table
+        // before constructing the router at all).
+        let mut body = serde_json::json!({ "status": "ready" });
+        if let Some(info) = &state.table_info {
+            body["records"] = serde_json::json!(info.records);
+            body["blocks"] = serde_json::json!(info.blocks);
+            body["parts"] = serde_json::json!(info.parts);
+            body["min_endpoint"] = serde_json::json!(info.min_endpoint);
+            body["max_endpoint"] = serde_json::json!(info.max_endpoint);
+        }
+        (StatusCode::OK, Json(body)).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -729,6 +765,22 @@ mod tests {
         .expect("encode candidate file")
     }
 
+    fn sample_table_info() -> TableInfo {
+        TableInfo {
+            records: 881_688,
+            blocks: 4096,
+            data_bytes: 12_345,
+            index_bytes: 6_789,
+            index_locked: false,
+            records_per_part: 1024,
+            parts: 861,
+            start_bits: 20,
+            rice_k: 16,
+            min_endpoint: 0x0000_0000_0000_0001,
+            max_endpoint: 0xffff_ffff_ffff_fffe,
+        }
+    }
+
     /// Test harness: a real `SubmissionStore` + real `WorkerPool` (running
     /// `FakeBackend`) + the real router, all in a tempdir. `sleep` controls
     /// how long the fake lookup takes, so tests can observe
@@ -761,8 +813,9 @@ mod tests {
             backend,
         );
         let ready = Arc::new(AtomicBool::new(true));
-        let router =
-            build_router(Arc::clone(&config), store, pool.handle(), ready).expect("build router");
+        let table_info = Some(Arc::new(sample_table_info()));
+        let router = build_router(Arc::clone(&config), store, pool.handle(), ready, table_info)
+            .expect("build router");
 
         Harness {
             _dir: dir,
@@ -1100,10 +1153,59 @@ mod tests {
             backend,
         );
         let ready = Arc::new(AtomicBool::new(false));
-        let router = build_router(config, store, pool.handle(), ready).unwrap();
+        let router = build_router(config, store, pool.handle(), ready, None).unwrap();
 
         let response = call(&router, "GET", "/health/ready", Vec::new(), vec![]).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn health_ready_reports_table_info_fields_when_ready() {
+        let harness = harness();
+        let response = call(&harness.router, "GET", "/health/ready", Vec::new(), vec![]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let info = sample_table_info();
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["records"], info.records);
+        assert_eq!(body["blocks"], info.blocks);
+        assert_eq!(body["parts"], info.parts);
+        assert_eq!(body["min_endpoint"], info.min_endpoint);
+        assert_eq!(body["max_endpoint"], info.max_endpoint);
+    }
+
+    #[tokio::test]
+    async fn anonymous_request_to_submit_route_gets_401_with_www_authenticate() {
+        // Regression test for finding #6: every other auth test hits
+        // /status or a successful authenticated submit -- nothing
+        // previously proved an anonymous request against the *submit*
+        // route specifically was covered by the router-layer auth
+        // middleware (the plan's whole reason for using a router-layer
+        // middleware over a per-handler extractor: it's one forgotten
+        // handler away from a bypass).
+        let harness = harness_with(Duration::from_millis(50), |config| {
+            config.auth_user = Some("alice".to_string());
+            config.auth_password = Some("hunter2".to_string());
+        });
+        let response = call(
+            &harness.router,
+            "POST",
+            "/api/v1/submissions",
+            b"not a real endpoint file".to_vec(),
+            vec![("content-type", "application/vnd.netntlmv1.endpoints")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let headers = headers_of(&response);
+        assert_eq!(
+            headers.get(header::WWW_AUTHENTICATE).unwrap(),
+            "Basic realm=\"ntlmrain\""
+        );
+        let detail = body_json(response).await;
+        assert_eq!(
+            detail["detail"],
+            "authentication required; set --remote-username/--remote-password"
+        );
     }
 
     #[tokio::test]

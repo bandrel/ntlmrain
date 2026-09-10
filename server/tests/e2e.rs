@@ -95,13 +95,14 @@ async fn spawn_fake_backend_app(
         Arc::clone(&store),
         backend,
     );
-    let reaper = Reaper::spawn(Arc::clone(&store));
+    let reaper = Reaper::spawn(Arc::clone(&store), dir.to_path_buf());
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let router = ntlmrain_server::http::build_router(
         Arc::clone(&config),
         Arc::clone(&store),
         pool.handle(),
         ready,
+        None,
     )
     .expect("build router");
 

@@ -45,10 +45,9 @@ pub struct App {
 ///
 /// Order matches the plan: table open first (so a bad table path fails
 /// fast, before any listener could ever answer `/health/ready` with a
-/// misleading "ready"), then the queue store (+ its own startup
-/// `restart_sweep`, called explicitly here even though `WorkerPool::spawn`
-/// below also runs one internally -- see that call's comment), then the
-/// worker pool and reaper, then the router.
+/// misleading "ready"), then the queue store, then the worker pool (whose
+/// `spawn` runs the startup `restart_sweep` itself -- see its doc comment)
+/// and reaper, then the router.
 pub fn build_app(config: Config) -> anyhow::Result<App> {
     let config = Arc::new(config);
 
@@ -73,22 +72,25 @@ pub fn build_app(config: Config) -> anyhow::Result<App> {
             config.index.display()
         )
     })?;
+    let table_info = Arc::new(table.info().clone());
     let backend: Arc<dyn LookupBackend> = Arc::new(LocalTableBackend(Arc::new(table)));
 
     let store = Arc::new(
         SubmissionStore::open(config.state_dir.join("queue.sqlite3"))
             .context("failed to open submission queue store")?,
     );
-    // Explicit startup sweep, per the plan's wiring order. `WorkerPool::spawn`
-    // below runs its own `restart_sweep()` first thing too (it needs to, so
-    // it's safe standalone) -- calling it here as well is a harmless no-op
-    // second pass (nothing is left `running` to sweep by the time it runs),
-    // kept so this function's own steps match the plan literally rather
-    // than relying solely on an internal.
-    if let Err(error) = store.restart_sweep() {
-        eprintln!("ntlmrain-server: startup restart_sweep failed: {error}");
-    }
-
+    // No explicit startup sweep here: `WorkerPool::spawn` below runs
+    // `store.restart_sweep()` itself before spawning any worker threads
+    // (see its doc comment), and this function creates exactly one
+    // `WorkerPool` over this `store`, so that single internal sweep is the
+    // only one this process ever needs. (An earlier version of this
+    // function also called `store.restart_sweep()` directly here first --
+    // redundant with, and always running strictly before, the sweep inside
+    // `WorkerPool::spawn`, so it was always a no-op. Removed rather than
+    // kept "for clarity": a duplicate call site is exactly the kind of
+    // thing that silently stops being a no-op if `WorkerPool::spawn`'s
+    // internals ever change, and `WorkerPool` already owns this
+    // responsibility.)
     let pool = WorkerPool::spawn(
         config.lookup_slots,
         Duration::from_secs(config.job_timeout_secs),
@@ -97,7 +99,7 @@ pub fn build_app(config: Config) -> anyhow::Result<App> {
         Arc::clone(&store),
         backend,
     );
-    let reaper = Reaper::spawn(Arc::clone(&store));
+    let reaper = Reaper::spawn(Arc::clone(&store), config.state_dir.clone());
 
     // The table opened successfully above, so the service is ready the
     // moment the router starts serving -- there is no separate async
@@ -108,6 +110,7 @@ pub fn build_app(config: Config) -> anyhow::Result<App> {
         Arc::clone(&store),
         pool.handle(),
         ready,
+        Some(table_info),
     )
     .context("failed to build HTTP router")?;
 

@@ -12,6 +12,39 @@
 //! cargo build --profile release-server -p ntlmrain-server
 //! ```
 
+// Build-time guard against building this crate with `panic = "abort"`.
+//
+// Cargo profiles are workspace-wide, and the root `Cargo.toml`'s
+// `[profile.release]` sets `panic = "abort"` for the CLI binary. Typing the
+// wrong-but-easy command `cargo build --release -p ntlmrain-server` would
+// silently inherit that: `tower_http::catch_panic::CatchPanicLayer`
+// (`http.rs`) becomes inert (there's nothing to unwind into), and so does
+// `worker.rs`'s `catch_unwind` around the backend call -- a single
+// handler/backend panic would then kill the whole daemon instead of
+// degrading to a `500`/failed job. A doc comment nobody reads is not a
+// guard, so this fails the build instead.
+//
+// This deliberately does NOT use a `build.rs` reading `CARGO_CFG_PANIC`:
+// measured against this toolchain, that build-script env var reports the
+// *target's default* panic strategy, not the panic strategy the profile
+// actually resolves to for this compilation -- it read "unwind" even when
+// rustc was invoked with `-C panic=abort` under `cargo build --release`.
+// `#[cfg(panic = "...")]` used directly in source, by contrast, is filled
+// in by rustc from the real `-C panic` flag it was invoked with for *this*
+// compilation unit, so it can't drift from what's actually happening.
+// `cargo test` always forces `unwind` regardless of profile, so this never
+// fires there.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "ntlmrain-server must be built with panic=\"unwind\", but this build's \
+     panic strategy is not \"unwind\". Cargo profiles are workspace-wide, so \
+     the root crate's [profile.release] (panic=\"abort\") applies to `cargo \
+     build --release -p ntlmrain-server` too, which would silently disable \
+     tower_http::catch_panic::CatchPanicLayer and worker.rs's catch_unwind \
+     guard around backend panics. Build this crate with:\n\n    cargo build \
+     --profile release-server -p ntlmrain-server\n"
+);
+
 use ntlmrain_server::config::Config;
 
 #[tokio::main]

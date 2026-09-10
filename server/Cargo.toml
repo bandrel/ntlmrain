@@ -23,7 +23,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["timeout", "catch-panic"] }
+tower-http = { version = "0.6", features = ["timeout", "catch-panic", "set-header"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -129,6 +129,11 @@ impl LookupControl {
     /// fake lookup backend that isn't actually reading table pages). The
     /// real `LocalTable` lookup path never calls this; it advances
     /// `processed` via its own internal `.store()` call sites.
+    ///
+    /// Hidden from the published `ntlmrain` crate's docs: this exists only
+    /// so `server/`'s `FakeBackend` test double can simulate progress, not
+    /// as a general-purpose public API of this crate.
+    #[doc(hidden)]
     pub fn set_processed(&self, value: u64) {
         self.processed.store(value, Ordering::Release);
     }

@@ -174,6 +174,22 @@ impl WorkerPool {
     /// previous crash (this process died mid-job, e.g. lost power) are
     /// requeued (or failed, past the retry cap) instead of stuck forever.
     ///
+    /// # Precondition: at most one `WorkerPool` per SQLite database, ever
+    ///
+    /// `restart_sweep()` unconditionally requeues every `running` row it
+    /// finds (up to the retry cap) on the assumption that "still `running`
+    /// at the moment I'm starting up" means "orphaned by a crash, no
+    /// worker is actually processing it". That assumption only holds if
+    /// this is the *only* `WorkerPool` ever operating over `store`'s
+    /// database. Spawning a second pool (in this process or another)
+    /// against the same on-disk database while a first pool still has jobs
+    /// genuinely in flight will requeue those jobs out from under the
+    /// worker that's legitimately running them, duplicating the work (and
+    /// racing both workers' terminal-state writes against each other).
+    /// Callers must ensure exactly one `WorkerPool` exists per database at
+    /// any given time; `lib.rs::build_app` upholds this by constructing
+    /// exactly one.
+    ///
     /// `job_timeout` bounds a single job's wall-clock run time.
     /// `max_match_records` bounds the result's `match_count`, enforced
     /// after the backend call succeeds. `state_dir` is the service's state
@@ -286,20 +302,44 @@ fn run_job(
     input_path: &str,
     record_count: i64,
 ) {
-    let input_blob = match fs::read(input_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = store.mark_failed(token_sha256, &format!("failed to read job input: {error}"));
-            let _ = fs::remove_file(input_path);
-            return;
-        }
-    };
-
+    // Register the control *before* reading the (up to 6.7 MiB) input
+    // blob, not after: a cancel request landing in that read window used
+    // to find no control entry to act on, so the row flipped to
+    // `cancelled` in the store while this worker went on to spend up to
+    // `job_timeout` (default 15 minutes) running the lookup anyway,
+    // discovering it lost the race only via `finalize_ready`'s guarded
+    // `mark_ready` at the very end. Registering first closes that window;
+    // the cancellation check immediately after the read closes what's left
+    // of it (a cancel landing mid-read is now caught before the backend
+    // call instead of after).
     let job_control = Arc::new(JobControl::new());
     controls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(token_sha256, Arc::clone(&job_control));
+
+    let input_blob = match fs::read(input_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = store.mark_failed(token_sha256, &format!("failed to read job input: {error}"));
+            controls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&token_sha256);
+            let _ = fs::remove_file(input_path);
+            return;
+        }
+    };
+
+    if job_control.lookup_control().is_cancelled() {
+        let _ = store.mark_cancelled(token_sha256);
+        controls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&token_sha256);
+        let _ = fs::remove_file(input_path);
+        return;
+    }
 
     // Heartbeat thread: checkpoints live progress into the store every
     // ~2s while the job runs. Stopped via a channel rather than a shared
@@ -438,22 +478,30 @@ fn write_result_blob(
     Ok(final_path.to_string_lossy().into_owned())
 }
 
+/// Minimum age a `.tmp` file (an interrupted `.end`/`.can` write) must
+/// reach before the orphan sweep considers it stale and safe to delete. A
+/// normal write-then-rename completes in well under this; anything older
+/// is left over from a crash mid-write.
+const STALE_TMP_AGE: Duration = Duration::from_secs(600);
+
 /// Background thread that periodically calls `store.reap` and deletes the
-/// filesystem paths it reports. Like `WorkerPool`, dropping it signals the
-/// thread to stop (via the same stop-channel pattern) but does not join.
+/// filesystem paths it reports, then sweeps `<state_dir>/jobs/` for
+/// orphaned blobs the row-driven report can't see (finding #2 of the final
+/// review). Like `WorkerPool`, dropping it signals the thread to stop (via
+/// the same stop-channel pattern) but does not join.
 pub struct Reaper {
     stop_tx: mpsc::Sender<()>,
 }
 
 impl Reaper {
-    pub fn spawn(store: Arc<SubmissionStore>) -> Self {
+    pub fn spawn(store: Arc<SubmissionStore>, state_dir: PathBuf) -> Self {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         thread::spawn(move || {
             loop {
                 match stop_rx.recv_timeout(REAP_INTERVAL) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
-                        reap_once(&store);
+                        reap_once(&store, &state_dir);
                     }
                 }
             }
@@ -468,10 +516,12 @@ impl Drop for Reaper {
     }
 }
 
-/// One reap sweep: ask the store what to clean up, then delete those
-/// filesystem paths. Split out from `Reaper::spawn`'s loop so tests can
-/// call a single sweep directly without waiting on `REAP_INTERVAL`.
-fn reap_once(store: &SubmissionStore) {
+/// One reap sweep: ask the store what to clean up, delete those
+/// filesystem paths, then sweep `<state_dir>/jobs/` for orphans the
+/// row-driven report doesn't (and can't) know about. Split out from
+/// `Reaper::spawn`'s loop so tests can call a single sweep directly
+/// without waiting on `REAP_INTERVAL`.
+fn reap_once(store: &SubmissionStore, state_dir: &Path) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is before the unix epoch")
@@ -492,6 +542,77 @@ fn reap_once(store: &SubmissionStore) {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             eprintln!("reaper: failed to delete {path}: {error}");
+        }
+    }
+    sweep_orphan_files(store, state_dir);
+}
+
+/// Walk `<state_dir>/jobs/<xx>/` (a small, two-level tree) and delete:
+/// - any `.end`/`.can` file whose token hash has no row in `store` at all
+///   (an orphan left behind by a crash between the blob rename and the
+///   `store.insert`/`mark_ready` call that was supposed to reference it,
+///   or by the generic-DB-error path in `http.rs`'s submit handler before
+///   its own cleanup was added); and
+/// - any `.tmp` file (an interrupted `.end.tmp`/`.can.tmp` write) older
+///   than [`STALE_TMP_AGE`].
+///
+/// The row-driven cleanup in `SubmissionStore::reap` can only ever report
+/// paths it has a row for; this sweep is the only thing that catches files
+/// with no row at all, which is exactly the "orphan file" case the plan's
+/// storage-lifecycle section calls out.
+fn sweep_orphan_files(store: &SubmissionStore, state_dir: &Path) {
+    let jobs_dir = state_dir.join("jobs");
+    let Ok(subdirs) = fs::read_dir(&jobs_dir) else {
+        return;
+    };
+    for subdir_entry in subdirs.flatten() {
+        let subdir_path = subdir_entry.path();
+        if !subdir_path.is_dir() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&subdir_path) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let file_path = file_entry.path();
+            let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            if name.ends_with(".tmp") {
+                let is_stale = file_entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age > STALE_TMP_AGE);
+                if is_stale {
+                    let _ = fs::remove_file(&file_path);
+                }
+                continue;
+            }
+
+            let Some(hex_part) = name
+                .strip_suffix(".end")
+                .or_else(|| name.strip_suffix(".can"))
+            else {
+                continue;
+            };
+            let Ok(bytes) = hex::decode(hex_part) else {
+                continue;
+            };
+            let Ok(token_sha256) = TokenHash::try_from(bytes.as_slice()) else {
+                continue;
+            };
+            match store.contains(token_sha256) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = fs::remove_file(&file_path);
+                }
+                Err(error) => {
+                    eprintln!("reaper: orphan-sweep store query failed: {error}");
+                }
+            }
         }
     }
 }
@@ -893,11 +1014,74 @@ mod tests {
         store.mark_cancelled(token(1)).unwrap();
         assert!(Path::new(&input_path).exists());
 
-        reap_once(&store);
+        reap_once(&store, dir.path());
 
         assert!(!Path::new(&input_path).exists());
         let row = store.get(token(1)).unwrap().unwrap();
         assert!(row.input_cleaned);
+    }
+
+    #[test]
+    fn orphan_sweep_deletes_end_and_can_files_with_no_matching_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap();
+
+        // A row exists for token(1): its .end blob must survive.
+        let hex1 = hex::encode(token(1));
+        let subdir1 = dir.path().join("jobs").join(&hex1[0..2]);
+        fs::create_dir_all(&subdir1).unwrap();
+        let kept_path = subdir1.join(format!("{hex1}.end"));
+        fs::write(&kept_path, b"referenced blob").unwrap();
+        store
+            .insert(token(1), 1, kept_path.to_str().unwrap(), 8, 8)
+            .unwrap();
+
+        // No row exists for token(2): its .end and .can blobs are orphans
+        // (e.g. left over from a crash between the blob rename and the
+        // store.insert/mark_ready call that was supposed to reference
+        // them) and must be deleted.
+        let hex2 = hex::encode(token(2));
+        let subdir2 = dir.path().join("jobs").join(&hex2[0..2]);
+        fs::create_dir_all(&subdir2).unwrap();
+        let orphan_end = subdir2.join(format!("{hex2}.end"));
+        let orphan_can = subdir2.join(format!("{hex2}.can"));
+        fs::write(&orphan_end, b"orphaned input blob").unwrap();
+        fs::write(&orphan_can, b"orphaned result blob").unwrap();
+
+        reap_once(&store, dir.path());
+
+        assert!(kept_path.exists(), "referenced blob must not be deleted");
+        assert!(!orphan_end.exists(), "orphaned .end blob must be deleted");
+        assert!(!orphan_can.exists(), "orphaned .can blob must be deleted");
+    }
+
+    #[test]
+    fn orphan_sweep_deletes_stale_tmp_files_but_leaves_fresh_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap();
+
+        let subdir = dir.path().join("jobs").join("ab");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let stale_tmp = subdir.join("deadbeef.end.tmp");
+        fs::write(&stale_tmp, b"interrupted write").unwrap();
+        // Back-date its mtime well past STALE_TMP_AGE (10 minutes) via the
+        // stable `File::set_modified` (no new dependency needed).
+        let stale_time = std::time::SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&stale_tmp)
+            .expect("open stale tmp for mtime update")
+            .set_modified(stale_time)
+            .expect("set stale mtime");
+
+        let fresh_tmp = subdir.join("cafebabe.can.tmp");
+        fs::write(&fresh_tmp, b"just started writing").unwrap();
+
+        reap_once(&store, dir.path());
+
+        assert!(!stale_tmp.exists(), "stale .tmp file must be deleted");
+        assert!(fresh_tmp.exists(), "fresh .tmp file must be left alone");
     }
 
     #[test]

@@ -49,6 +49,18 @@ const QUEUE_TIMEOUT_SECS: i64 = 1800;
 /// Attempts (post-increment) beyond which `restart_sweep` gives up on a
 /// `running` row instead of requeuing it again.
 const MAX_RESTART_ATTEMPTS: i64 = 2;
+/// How long a terminal `failed`/`cancelled` row is kept in the table after
+/// `finished_at` before `reap` prunes it outright. Mirrors the existing
+/// `RESULT_TTL_SECS`/`QUEUE_TIMEOUT_SECS` pattern immediately above (a
+/// fixed policy constant, not a CLI flag -- neither of those got one
+/// either, despite being the same kind of retention/timeout policy value).
+/// 24h is generous for an operator to have already noticed and acted on a
+/// failure while still bounding the table's long-run size; there is no
+/// wire-protocol reason to keep a terminal row around at all past the
+/// point its token has gone stale (`/status`/`/result`/`/cancel` all treat
+/// a merely-old-but-present row the same as a present one -- retention
+/// only controls when it stops existing, not any client-visible behavior).
+const TERMINAL_ROW_RETENTION_SECS: i64 = 24 * 3600;
 
 /// Schema DDL shared by every way of constructing a `SubmissionStore`
 /// (on-disk `open()` and, in tests, `open_in_memory()`), so the two paths
@@ -438,6 +450,23 @@ impl SubmissionStore {
         Ok(affected > 0)
     }
 
+    /// Whether a row exists for this token hash at all, regardless of
+    /// state. Used by the reaper's filesystem orphan-sweep (finding #2 of
+    /// the final review): a `.end`/`.can` blob under `<state-dir>/jobs/`
+    /// whose token hash has no row here is unreferenced and safe to
+    /// delete.
+    pub fn contains(&self, token_sha256: TokenHash) -> Result<bool> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM submissions WHERE token_sha256 = ?1",
+                params![token_sha256.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     /// Full row for the status/result/cancel handlers.
     pub fn get(&self, token_sha256: TokenHash) -> Result<Option<SubmissionRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -576,6 +605,20 @@ impl SubmissionStore {
         tx.execute(
             "DELETE FROM submissions WHERE state = 'ready' AND result_expires_at < ?1",
             params![now],
+        )?;
+
+        // Retention (finding #7 of the final review): `failed`/`cancelled`
+        // rows previously lived in the table forever -- only expired
+        // `ready` rows were ever deleted above. By the time a terminal row
+        // is this old its input has long since been reported for cleanup
+        // (the pass above already handles that on the same or an earlier
+        // sweep) and `failed`/`cancelled` rows never have a `result_path`
+        // to begin with, so this is a pure row delete with no filesystem
+        // side effect.
+        tx.execute(
+            "DELETE FROM submissions
+             WHERE state IN ('failed', 'cancelled') AND finished_at < ?1",
+            params![now - TERMINAL_ROW_RETENTION_SECS],
         )?;
 
         tx.commit()?;
@@ -880,6 +923,69 @@ mod tests {
         let mut cleanup = report.cleanup_input_paths.clone();
         cleanup.sort();
         assert_eq!(cleanup, vec!["/in1".to_string(), "/in2".to_string()]);
+    }
+
+    #[test]
+    fn contains_reflects_whether_a_row_exists_regardless_of_state() {
+        let store = SubmissionStore::open_in_memory().expect("open");
+        assert!(!store.contains(token(1)).unwrap());
+
+        store.insert(token(1), 1, "/in1", 8, 8).unwrap();
+        assert!(store.contains(token(1)).unwrap());
+
+        store.mark_cancelled(token(1)).unwrap();
+        assert!(store.contains(token(1)).unwrap());
+
+        assert!(!store.contains(token(2)).unwrap());
+    }
+
+    #[test]
+    fn reap_prunes_old_failed_and_cancelled_rows_but_leaves_recent_ones() {
+        let store = SubmissionStore::open_in_memory().expect("open");
+
+        // An old failed row: finished well past the retention window.
+        store.insert(token(1), 1, "/in1", 8, 8).unwrap();
+        store.mark_failed(token(1), "boom").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE submissions SET finished_at = ?2 WHERE token_sha256 = ?1",
+                params![
+                    token(1).as_slice(),
+                    now_unix() - TERMINAL_ROW_RETENTION_SECS - 1
+                ],
+            )
+            .unwrap();
+        }
+
+        // An old cancelled row: same deal.
+        store.insert(token(2), 1, "/in2", 8, 8).unwrap();
+        store.mark_cancelled(token(2)).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE submissions SET finished_at = ?2 WHERE token_sha256 = ?1",
+                params![
+                    token(2).as_slice(),
+                    now_unix() - TERMINAL_ROW_RETENTION_SECS - 1
+                ],
+            )
+            .unwrap();
+        }
+
+        // A recently-failed row: must survive this sweep.
+        store.insert(token(3), 1, "/in3", 8, 8).unwrap();
+        store.mark_failed(token(3), "boom").unwrap();
+
+        let report = store.reap(now_unix()).unwrap();
+        // Both old terminal rows' inputs were already reported for cleanup
+        // by this same sweep's terminal-input pass (or an earlier one);
+        // the row delete itself has no filesystem side effect.
+        let _ = report;
+
+        assert!(store.get(token(1)).unwrap().is_none());
+        assert!(store.get(token(2)).unwrap().is_none());
+        assert!(store.get(token(3)).unwrap().is_some());
     }
 
     #[test]
