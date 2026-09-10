@@ -5,14 +5,13 @@
 //! fixed by the plan and must match it exactly -- see the field-name list
 //! in this crate's Task 4 report.
 //!
-//! Nothing in this module is wired into `main.rs` yet -- that happens in
-//! Task 5 -- so allow dead code for now, matching `backend.rs`/`queue.rs`/
-//! `worker.rs`'s existing convention.
+//! Wired into `main.rs` via `lib.rs::build_app` (Task 5), which also adds
+//! a 120s read timeout on the submit route -- see `SUBMIT_READ_TIMEOUT`.
 #![allow(dead_code)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -25,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use ntlmrain::local_lookup::parse_endpoint_file;
 
@@ -45,6 +45,16 @@ const SUBMIT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// oversized/malformed body is rejected before any JSON parsing work.
 const JSON_BODY_LIMIT: usize = 4096;
 const UNKNOWN_TOKEN_DETAIL: &str = "unknown or expired submission token";
+/// Read timeout on `POST /api/v1/submissions` only: the up-to-8-MiB
+/// submission body may arrive slowly over a poor connection, and this
+/// bounds how long the server waits on it before giving up. Task 4 (which
+/// built this router) deliberately left this out; added here in Task 5
+/// alongside the rest of the wiring (see `build_router`'s doc comment).
+/// Applied via `tower_http::timeout::TimeoutLayer` rather than a bespoke
+/// deadline check so it's enforced uniformly for the whole
+/// request/response cycle (including the slow-body case) the same way
+/// `tower_http` enforces it elsewhere in this router (`CatchPanicLayer`).
+const SUBMIT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Central error type: every handler returns `Result<_, ApiError>` so the
 /// FastAPI-shaped `{"detail": ...}` error body is constructed in exactly
@@ -142,19 +152,33 @@ pub fn build_router(
         ready,
     };
 
-    let submissions_router = Router::new()
-        .route(
-            "/api/v1/submissions",
-            post(submit_handler)
-                .layer(DefaultBodyLimit::max(SUBMIT_BODY_LIMIT))
-                // Outermost layer on this route: the admission semaphore
-                // must be acquired before the handler's `Bytes` extractor
-                // runs (and thus before the up-to-8-MiB body is buffered).
-                .layer(middleware::from_fn_with_state(
-                    app_state.clone(),
-                    admission_middleware,
-                )),
-        )
+    // Built as its own `Router` (rather than a `MethodRouter::layer` chain
+    // like the other three routes below) specifically so the outermost
+    // `TimeoutLayer` can be added via `Router::layer`: stacking three
+    // `MethodRouter::layer` calls left axum unable to infer the
+    // handler-error type at the point `TimeoutLayer` was added, since
+    // `MethodRouter::layer` is generic over it and nothing pins it until
+    // the route is merged into a `Router` (which is `Infallible`-only).
+    let submit_route = Router::new()
+        .route("/api/v1/submissions", post(submit_handler))
+        .layer(DefaultBodyLimit::max(SUBMIT_BODY_LIMIT))
+        // Second-outermost: the admission semaphore must be acquired
+        // before the handler's `Bytes` extractor runs (and thus before
+        // the up-to-8-MiB body is buffered).
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            admission_middleware,
+        ))
+        // Outermost layer on this route: bounds the whole
+        // request/response cycle, including however long the client
+        // takes to finish sending its body, at `SUBMIT_READ_TIMEOUT`. See
+        // that const's doc comment.
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            SUBMIT_READ_TIMEOUT,
+        ));
+
+    let submissions_router = submit_route
         .route(
             "/api/v1/submissions/status",
             post(status_handler).layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),

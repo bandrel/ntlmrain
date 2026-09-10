@@ -28,6 +28,11 @@ tower-http = { version = "0.6", features = ["timeout", "catch-panic"] }
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# For tests/e2e.rs's manual-protocol checks only (malformed requests the
+# CLI's own `RemoteLookupClient` won't construct); already resolved in the
+# workspace lockfile transitively via `ntlmrain`'s own `reqwest` dependency
+# (that one's `blocking` feature; this one adds the async client instead).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [[bin]]
 name = "ntlmrain-server"

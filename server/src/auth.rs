@@ -6,9 +6,8 @@
 //! `WWW-Authenticate` ever emitted) when no credentials are configured;
 //! otherwise every request must present valid HTTP Basic credentials.
 //!
-//! Nothing in this module is wired into `main.rs` yet — that happens in
-//! Task 5 — so allow dead code for now, matching `backend.rs`/`queue.rs`/
-//! `worker.rs`'s existing convention.
+//! Wired into `main.rs` via `lib.rs::build_app` -> `http::build_router`
+//! (Task 5).
 #![allow(dead_code)]
 
 use std::sync::Arc;

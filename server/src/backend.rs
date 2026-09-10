@@ -5,9 +5,8 @@
 //! `LocalTableBackend`, while queue/worker tests run against `FakeBackend`
 //! without needing a real GRTB table on disk.
 //!
-//! Nothing in this module is wired into `main.rs` yet — that happens in
-//! later tasks (queue/worker/HTTP layer) — so allow dead code for now
-//! rather than have every downstream task re-add these allows piecemeal.
+//! Wired into `main.rs` via `lib.rs::build_app` (Task 5): production runs
+//! `LocalTableBackend`.
 #![allow(dead_code)]
 
 use std::sync::Arc;
