@@ -1,7 +1,6 @@
 mod backend;
 mod config;
 
-use clap::Parser;
 use config::Config;
 
 fn main() {
@@ -10,6 +9,6 @@ fn main() {
         eprintln!("ntlmrain-server: {error}");
         std::process::exit(1);
     }
-    println!("config OK, server not yet implemented");
-    println!("{config:#?}");
+    let _ = config;
+    eprintln!("config OK, server not yet implemented");
 }
