@@ -333,7 +333,19 @@ fn run_job(
         })
     };
 
-    let result = backend.lookup(&input_blob, job_control.lookup_control());
+    // Guard against a backend panic (malformed table page, an internal
+    // `unwrap`, allocation failure, ...): without this, the panic would
+    // unwind straight out of `worker_loop`, permanently retiring this
+    // worker's thread (dropping the pool from N to N-1 slots for the rest
+    // of the process's life), leaking this job's `controls` entry forever
+    // (so `WorkerPoolHandle::cancel`/`processed` would keep reporting a
+    // dead job as live), and leaving the row stuck `running` until a full
+    // restart. Catching it here lets the worker report `failed` and keep
+    // looping, same as any other backend error.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.lookup(&input_blob, job_control.lookup_control())
+    }))
+    .unwrap_or_else(|_| Err(LookupBackendError::Invalid("lookup panicked".to_string())));
 
     // Stop and join both helper threads before touching the store again,
     // so a slow heartbeat/timer thread can't race the terminal-state
@@ -353,7 +365,7 @@ fn run_job(
                     } else {
                         match write_result_blob(state_dir, token_sha256, &result_bytes) {
                             Ok(result_path) => {
-                                let _ = store.mark_ready(token_sha256, match_count, &result_path);
+                                finalize_ready(store, token_sha256, match_count, &result_path);
                             }
                             Err(error) => {
                                 let _ = store.mark_failed(
@@ -387,6 +399,24 @@ fn run_job(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&token_sha256);
     let _ = fs::remove_file(input_path);
+}
+
+/// Marks a completed job `ready`, and cleans up after itself if it lost a
+/// race: `store.mark_ready` is guarded to `state = 'running'` and returns
+/// `false` if the row already left that state (e.g. a concurrent cancel
+/// won). In that case the result file we just wrote to disk is now
+/// unreferenced by any row — the reaper only ever cleans up `result_path`s
+/// it finds on a `ready` row — so we delete it ourselves here rather than
+/// leaking it forever.
+fn finalize_ready(
+    store: &SubmissionStore,
+    token_sha256: TokenHash,
+    match_count: u64,
+    result_path: &str,
+) {
+    if let Ok(false) = store.mark_ready(token_sha256, match_count, result_path) {
+        let _ = fs::remove_file(result_path);
+    }
 }
 
 /// Write `bytes` to `<state_dir>/jobs/<hex[0:2]>/<hex>.can` via a
@@ -868,5 +898,119 @@ mod tests {
         assert!(!Path::new(&input_path).exists());
         let row = store.get(token(1)).unwrap().unwrap();
         assert!(row.input_cleaned);
+    }
+
+    #[test]
+    fn finalize_ready_deletes_the_result_file_when_mark_ready_loses_the_race() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap();
+        let input_path = write_input(dir.path(), "in1.end");
+        store.insert(token(1), 1, &input_path, 8, 8).unwrap();
+        store.claim_next_queued().unwrap();
+
+        // Simulate a cancel landing between the worker writing the result
+        // file and calling mark_ready: the row leaves 'running' first.
+        assert!(store.mark_cancelled(token(1)).unwrap());
+
+        let result_path = dir.path().join("orphan.can");
+        fs::write(&result_path, b"result bytes").unwrap();
+        assert!(result_path.exists());
+
+        finalize_ready(&store, token(1), 1, result_path.to_str().unwrap());
+
+        // mark_ready lost the race (row is 'cancelled', not 'running'), so
+        // the file we just wrote must not be left behind on disk forever.
+        assert!(!result_path.exists());
+        let row = store.get(token(1)).unwrap().unwrap();
+        assert_eq!(row.state, SubmissionState::Cancelled);
+    }
+
+    #[test]
+    fn finalize_ready_leaves_the_result_file_in_place_when_mark_ready_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap();
+        let input_path = write_input(dir.path(), "in1.end");
+        store.insert(token(1), 1, &input_path, 8, 8).unwrap();
+        store.claim_next_queued().unwrap();
+
+        let result_path = dir.path().join("result.can");
+        fs::write(&result_path, b"result bytes").unwrap();
+
+        finalize_ready(&store, token(1), 3, result_path.to_str().unwrap());
+
+        assert!(result_path.exists());
+        let row = store.get(token(1)).unwrap().unwrap();
+        assert_eq!(row.state, SubmissionState::Ready);
+        assert_eq!(row.match_count, Some(3));
+    }
+
+    /// Always panics; used to prove a backend panic doesn't retire a
+    /// worker slot or leak a `controls` map entry.
+    struct PanicBackend;
+
+    impl LookupBackend for PanicBackend {
+        fn lookup(
+            &self,
+            _endpoint_file: &[u8],
+            _control: &LookupControl,
+        ) -> std::result::Result<Vec<u8>, LookupBackendError> {
+            panic!("boom: simulated backend panic");
+        }
+    }
+
+    #[test]
+    fn backend_panic_fails_the_job_and_the_worker_keeps_looping() {
+        // This test intentionally triggers a caught panic; expect to see
+        // "thread '...' panicked at ...: boom: simulated backend panic"
+        // on stderr even though the test passes — that's the default
+        // panic hook, not a test failure.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap());
+        let backend: Arc<dyn LookupBackend> = Arc::new(PanicBackend);
+
+        let input_path1 = write_input(dir.path(), "in1.end");
+        store.insert(token(1), 1, &input_path1, 8, 8).unwrap();
+
+        let pool = WorkerPool::spawn(
+            1,
+            Duration::from_secs(60),
+            1_000,
+            dir.path().to_path_buf(),
+            Arc::clone(&store),
+            backend,
+        );
+
+        assert!(wait_until(
+            || {
+                store
+                    .get(token(1))
+                    .unwrap()
+                    .is_some_and(|row| row.state == SubmissionState::Failed)
+            },
+            Duration::from_secs(5)
+        ));
+        let row = store.get(token(1)).unwrap().unwrap();
+        assert_eq!(row.error.as_deref(), Some("lookup panicked"));
+
+        // The panic was caught and the controls-map entry was cleaned up
+        // like any other terminal job: nothing left to cancel.
+        assert!(!pool.handle().cancel(token(1)));
+
+        // Prove the worker's thread survived the panic and is still
+        // looping (not a permanently retired slot): a second job gets
+        // picked up and driven to a terminal state too.
+        let input_path2 = write_input(dir.path(), "in2.end");
+        store.insert(token(2), 1, &input_path2, 8, 8).unwrap();
+        assert!(wait_until(
+            || {
+                store
+                    .get(token(2))
+                    .unwrap()
+                    .is_some_and(|row| row.state == SubmissionState::Failed)
+            },
+            Duration::from_secs(5)
+        ));
+
+        drop(pool);
     }
 }
