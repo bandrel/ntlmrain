@@ -1,5 +1,6 @@
 mod backend;
 mod config;
+mod queue;
 
 use config::Config;
 
