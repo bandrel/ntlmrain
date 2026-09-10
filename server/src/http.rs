@@ -175,6 +175,7 @@ pub fn build_router(
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(docs_page))
         .with_state(app_state);
 
     let router = Router::new()
@@ -360,12 +361,17 @@ async fn status_handler(State(state): State<AppState>, body: Bytes) -> Result<Re
     };
 
     let record_count = row.record_count as u64;
-    // Never divide by zero: queued jobs report literal 0.0 (processed/0
-    // would be NaN and fail the client's is_finite() check).
+    // Never divide by zero (queued jobs report literal 0.0 -- processed/0
+    // would be NaN and fail the client's is_finite() check) and always
+    // clamp into 0.0..=1.0: `processed_records` can legitimately exceed
+    // `record_count` (e.g. a backend's own progress counter isn't
+    // strictly record-count-scoped, as with `FakeBackend`'s raw tick
+    // counter), and the client hard-errors on anything outside that
+    // range (src/remote_lookup.rs's status invariant check).
     let progress = if record_count == 0 {
         0.0
     } else {
-        processed_records as f64 / record_count as f64
+        (processed_records as f64 / record_count as f64).clamp(0.0, 1.0)
     };
 
     let queue_position = if row.state == SubmissionState::Queued {
@@ -490,6 +496,24 @@ async fn health_ready(State(state): State<AppState>) -> Response {
         )
             .into_response()
     }
+}
+
+/// Minimal static page pointing at `/openapi.json`, for parity with the
+/// public service's `/docs` route (plan's Wire protocol table). The real
+/// CLI client never requests this; a full Swagger-UI-style page is out of
+/// scope (no new dependency), so this is a hand-written link.
+async fn docs_page() -> impl IntoResponse {
+    let html = concat!(
+        "<!doctype html><html><head><title>ntlmrain-server API docs</title></head>",
+        "<body><h1>ntlmrain-server</h1>",
+        "<p>See the OpenAPI document: <a href=\"/openapi.json\">/openapi.json</a></p>",
+        "</body></html>",
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
 }
 
 async fn openapi_json() -> impl IntoResponse {
@@ -764,6 +788,23 @@ mod tests {
         response.headers().clone()
     }
 
+    /// Asserts the client's hard invariant (`src/remote_lookup.rs`):
+    /// `progress` must be finite and within `0.0..=1.0`. Called on every
+    /// sampled status body during a polling loop, not just the terminal
+    /// one, since the live-control path (used while `state=='running'`)
+    /// and the checkpointed-column path (used otherwise) are both
+    /// reachable and both must uphold it.
+    fn assert_progress_invariant(body: &serde_json::Value) {
+        let progress = body["progress"]
+            .as_f64()
+            .expect("progress field must be present and numeric");
+        assert!(
+            progress.is_finite() && (0.0..=1.0).contains(&progress),
+            "progress {progress} outside 0.0..=1.0 (state={:?})",
+            body["state"]
+        );
+    }
+
     #[tokio::test]
     async fn submit_then_status_transitions_queued_running_ready_with_progress_and_match_count() {
         let harness = harness_with(Duration::from_millis(150), |_| {});
@@ -802,7 +843,7 @@ mod tests {
         let status_body = body_json(status_response).await;
         let first_state = status_body["state"].as_str().unwrap().to_string();
         assert!(matches!(first_state.as_str(), "queued" | "running"));
-        assert!(status_body["progress"].as_f64().unwrap() >= 0.0);
+        assert_progress_invariant(&status_body);
         assert!(status_body["match_count"].is_null());
         assert!(status_body["error"].is_null());
 
@@ -816,6 +857,7 @@ mod tests {
         let mut final_body = status_body;
         let mut observed_live_progress = false;
         loop {
+            assert_progress_invariant(&final_body);
             if final_body["state"] == "ready" {
                 break;
             }
@@ -852,12 +894,11 @@ mod tests {
         // control is gone from the worker pool's map by then) -- the
         // worker's ~2s heartbeat interval (worker.rs's HEARTBEAT_INTERVAL)
         // is far longer than this test's fake lookup, so the checkpoint
-        // may never have run before the job finished. Assert the wire
-        // invariant this layer is responsible for (finite, in 0.0..=1.0
-        // per src/remote_lookup.rs's client-side check), not a specific
-        // value that depends on Task 3's heartbeat timing.
-        let final_progress = final_body["progress"].as_f64().unwrap();
-        assert!(final_progress.is_finite() && (0.0..=1.0).contains(&final_progress));
+        // may never have run before the job finished. The polling loop
+        // above already asserted the wire invariant (finite, in
+        // 0.0..=1.0 per src/remote_lookup.rs's client-side check) on
+        // every sample including this one; not asserting a specific
+        // value here since it depends on Task 3's heartbeat timing.
         assert!(final_body["queue_position"].is_null());
         assert!(final_body["download_within_seconds"].as_f64().unwrap() > 0.0);
 
@@ -1053,6 +1094,25 @@ mod tests {
         assert!(body["paths"]["/api/v1/submissions/cancel"].is_object());
     }
 
+    #[tokio::test]
+    async fn docs_page_returns_html_linking_to_openapi_json() {
+        let harness = harness();
+        let response = call(&harness.router, "GET", "/docs", Vec::new(), vec![]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = headers_of(&response);
+        assert!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("/openapi.json"));
+    }
+
     fn harness_with_auth(user: &str, password: &str) -> Harness {
         harness_with(Duration::from_millis(50), |config| {
             config.auth_user = Some(user.to_string());
@@ -1131,6 +1191,8 @@ mod tests {
         assert_eq!(live.status(), StatusCode::OK);
         let openapi = call(&harness.router, "GET", "/openapi.json", Vec::new(), vec![]).await;
         assert_eq!(openapi.status(), StatusCode::OK);
+        let docs = call(&harness.router, "GET", "/docs", Vec::new(), vec![]).await;
+        assert_eq!(docs.status(), StatusCode::OK);
     }
 
     #[test]
