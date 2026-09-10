@@ -1,5 +1,7 @@
+mod auth;
 mod backend;
 mod config;
+mod http;
 mod queue;
 mod worker;
 
