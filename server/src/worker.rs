@@ -547,14 +547,40 @@ fn reap_once(store: &SubmissionStore, state_dir: &Path) {
     sweep_orphan_files(store, state_dir);
 }
 
+/// Whether `entry`'s mtime is older than [`STALE_TMP_AGE`] (or its mtime
+/// can't be determined at all, in which case it's treated as stale rather
+/// than silently never being swept).
+fn is_stale(entry: &fs::DirEntry) -> bool {
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_none_or(|age| age > STALE_TMP_AGE)
+}
+
 /// Walk `<state_dir>/jobs/<xx>/` (a small, two-level tree) and delete:
-/// - any `.end`/`.can` file whose token hash has no row in `store` at all
-///   (an orphan left behind by a crash between the blob rename and the
-///   `store.insert`/`mark_ready` call that was supposed to reference it,
-///   or by the generic-DB-error path in `http.rs`'s submit handler before
-///   its own cleanup was added); and
+/// - any `.end`/`.can` file older than [`STALE_TMP_AGE`] whose token hash
+///   has no row in `store` at all (an orphan left behind by a crash
+///   between the blob rename and the `store.insert`/`mark_ready` call that
+///   was supposed to reference it, or by the generic-DB-error path in
+///   `http.rs`'s submit handler before its own cleanup was added); and
 /// - any `.tmp` file (an interrupted `.end.tmp`/`.can.tmp` write) older
-///   than [`STALE_TMP_AGE`].
+///   than the same threshold.
+///
+/// The `.end`/`.can` branch is age-gated too, not just `.tmp`: without it,
+/// this sweep can race a legitimate in-flight submission. `http.rs`'s
+/// submit handler renames the `.end` blob into place *before* calling
+/// `store.insert` (finding #2 of the final review's storage-lifecycle
+/// fix), so there's a real (if normally brief) window where a freshly
+/// written blob has no row yet -- and `SubmissionStore`'s single-mutex
+/// connection can widen that window if a `reap()` cycle is already holding
+/// the lock when `insert` tries to run. A sweep landing in that window
+/// with no age gate would see "no row" and delete a blob whose insert was
+/// about to succeed, turning a legitimate submission into a
+/// `"failed to read job input"` job. No legitimate orphan needs collecting
+/// within seconds of creation, so gating on the same threshold as `.tmp`
+/// closes the race with no loss of cleanup coverage.
 ///
 /// The row-driven cleanup in `SubmissionStore::reap` can only ever report
 /// paths it has a row for; this sweep is the only thing that catches files
@@ -580,13 +606,7 @@ fn sweep_orphan_files(store: &SubmissionStore, state_dir: &Path) {
             };
 
             if name.ends_with(".tmp") {
-                let is_stale = file_entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
-                    .is_some_and(|age| age > STALE_TMP_AGE);
-                if is_stale {
+                if is_stale(&file_entry) {
                     let _ = fs::remove_file(&file_path);
                 }
                 continue;
@@ -598,6 +618,12 @@ fn sweep_orphan_files(store: &SubmissionStore, state_dir: &Path) {
             else {
                 continue;
             };
+            // Age gate first (cheap, local) before the store round-trip:
+            // a file too young to be considered for collection at all
+            // doesn't need a `contains()` query either.
+            if !is_stale(&file_entry) {
+                continue;
+            }
             let Ok(bytes) = hex::decode(hex_part) else {
                 continue;
             };
@@ -649,6 +675,18 @@ mod tests {
         file.write_all(b"fake endpoint blob")
             .expect("write input blob");
         path.to_string_lossy().into_owned()
+    }
+
+    /// Back-date `path`'s mtime by `age` via the stable `File::set_modified`
+    /// (no new dependency needed), so tests can simulate a file that's
+    /// older than `STALE_TMP_AGE` without actually sleeping.
+    fn backdate(path: &Path, age: Duration) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open file for mtime update")
+            .set_modified(std::time::SystemTime::now() - age)
+            .expect("set backdated mtime");
     }
 
     fn wait_until<F: FnMut() -> bool>(mut predicate: F, timeout: Duration) -> bool {
@@ -1022,22 +1060,26 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sweep_deletes_end_and_can_files_with_no_matching_row() {
+    fn orphan_sweep_deletes_stale_end_and_can_files_with_no_matching_row() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap();
 
-        // A row exists for token(1): its .end blob must survive.
+        // A row exists for token(1): its .end blob must survive regardless
+        // of age.
         let hex1 = hex::encode(token(1));
         let subdir1 = dir.path().join("jobs").join(&hex1[0..2]);
         fs::create_dir_all(&subdir1).unwrap();
         let kept_path = subdir1.join(format!("{hex1}.end"));
         fs::write(&kept_path, b"referenced blob").unwrap();
+        backdate(&kept_path, Duration::from_secs(3600));
         store
             .insert(token(1), 1, kept_path.to_str().unwrap(), 8, 8)
             .unwrap();
 
-        // No row exists for token(2): its .end and .can blobs are orphans
-        // (e.g. left over from a crash between the blob rename and the
+        // No row exists for token(2), and its blobs are old enough (past
+        // STALE_TMP_AGE) to no longer be in the submit-handler's
+        // rename-then-insert race window: these are genuine orphans (e.g.
+        // left over from a crash between the blob rename and the
         // store.insert/mark_ready call that was supposed to reference
         // them) and must be deleted.
         let hex2 = hex::encode(token(2));
@@ -1047,12 +1089,51 @@ mod tests {
         let orphan_can = subdir2.join(format!("{hex2}.can"));
         fs::write(&orphan_end, b"orphaned input blob").unwrap();
         fs::write(&orphan_can, b"orphaned result blob").unwrap();
+        backdate(&orphan_end, Duration::from_secs(3600));
+        backdate(&orphan_can, Duration::from_secs(3600));
 
         reap_once(&store, dir.path());
 
         assert!(kept_path.exists(), "referenced blob must not be deleted");
-        assert!(!orphan_end.exists(), "orphaned .end blob must be deleted");
-        assert!(!orphan_can.exists(), "orphaned .can blob must be deleted");
+        assert!(
+            !orphan_end.exists(),
+            "stale orphaned .end blob must be deleted"
+        );
+        assert!(
+            !orphan_can.exists(),
+            "stale orphaned .can blob must be deleted"
+        );
+    }
+
+    #[test]
+    fn orphan_sweep_leaves_a_freshly_written_rowless_end_file_alone() {
+        // Regression test for the race the final re-review caught: the
+        // submit handler renames the .end blob into place *before*
+        // calling store.insert, so a sweep landing in that window would
+        // (without an age gate) see "no row yet" and delete a blob whose
+        // insert was about to succeed. Simulates that window by writing a
+        // .end file with no matching row and *not* backdating it -- it
+        // must survive one sweep cycle since it's younger than
+        // STALE_TMP_AGE.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SubmissionStore::open(dir.path().join("queue.sqlite3")).unwrap();
+
+        let hex = hex::encode(token(3));
+        let subdir = dir.path().join("jobs").join(&hex[0..2]);
+        fs::create_dir_all(&subdir).unwrap();
+        let racy_path = subdir.join(format!("{hex}.end"));
+        fs::write(
+            &racy_path,
+            b"blob renamed into place, insert not yet committed",
+        )
+        .unwrap();
+
+        reap_once(&store, dir.path());
+
+        assert!(
+            racy_path.exists(),
+            "a freshly-written rowless .end file must survive a sweep within the race window"
+        );
     }
 
     #[test]
@@ -1065,15 +1146,8 @@ mod tests {
 
         let stale_tmp = subdir.join("deadbeef.end.tmp");
         fs::write(&stale_tmp, b"interrupted write").unwrap();
-        // Back-date its mtime well past STALE_TMP_AGE (10 minutes) via the
-        // stable `File::set_modified` (no new dependency needed).
-        let stale_time = std::time::SystemTime::now() - Duration::from_secs(3600);
-        fs::File::options()
-            .write(true)
-            .open(&stale_tmp)
-            .expect("open stale tmp for mtime update")
-            .set_modified(stale_time)
-            .expect("set stale mtime");
+        // Back-date its mtime well past STALE_TMP_AGE (10 minutes).
+        backdate(&stale_tmp, Duration::from_secs(3600));
 
         let fresh_tmp = subdir.join("cafebabe.can.tmp");
         fs::write(&fresh_tmp, b"just started writing").unwrap();
