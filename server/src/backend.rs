@@ -74,13 +74,12 @@ impl LookupBackend for LocalTableBackend {
 /// Test backend used by Tasks 2/3/5 to exercise queue/worker behavior
 /// without a real GRTB table on disk.
 ///
-/// Note: `ntlmrain::local_lookup::LookupControl::processed` has no public
-/// setter (it is only ever written to from within `local_lookup.rs`, which
-/// is out of scope for this task), so `FakeBackend` cannot actually advance
-/// `control.processed()` during its simulated sleep. It still ticks in
-/// small increments and checks `control.is_cancelled()` on each tick, which
-/// is what makes cancellation responsive; only the "processed() moves"
-/// part of the spec is unimplementable without a `local_lookup.rs` change.
+/// During its simulated sleep it ticks in `tick`-sized increments,
+/// checking `control.is_cancelled()` on each tick (returning
+/// `LookupBackendError::Cancelled` immediately if set) and advancing
+/// `control.processed()` via `LookupControl::set_processed` so callers
+/// polling progress see it move, the same way a real lookup's page reads
+/// would.
 pub struct FakeBackend {
     /// Total simulated work duration before returning success.
     sleep: Duration,
@@ -107,6 +106,7 @@ impl LookupBackend for FakeBackend {
         control: &LookupControl,
     ) -> Result<Vec<u8>, LookupBackendError> {
         let deadline = Instant::now() + self.sleep;
+        let mut ticks: u64 = 0;
         loop {
             if control.is_cancelled() {
                 return Err(LookupBackendError::Cancelled);
@@ -117,6 +117,8 @@ impl LookupBackend for FakeBackend {
             }
             let remaining = deadline - now;
             std::thread::sleep(self.tick.min(remaining));
+            ticks += 1;
+            control.set_processed(ticks);
         }
         if control.is_cancelled() {
             return Err(LookupBackendError::Cancelled);
@@ -155,6 +157,33 @@ mod tests {
         let result = backend.lookup(&[], &control).expect("lookup succeeds");
         assert!(started.elapsed() >= Duration::from_millis(25));
         assert_eq!(result, canned_response());
+    }
+
+    #[test]
+    fn fake_backend_advances_processed_during_simulated_sleep() {
+        let backend = Arc::new(FakeBackend::new(
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+            canned_response(),
+        ));
+        let control = Arc::new(LookupControl::default());
+        assert_eq!(control.processed(), 0);
+
+        let worker_backend = Arc::clone(&backend);
+        let worker_control = Arc::clone(&control);
+        let handle = thread::spawn(move || worker_backend.lookup(&[], &worker_control));
+
+        // Give the fake a chance to tick a few times before it finishes.
+        thread::sleep(Duration::from_millis(60));
+        let mid_flight = control.processed();
+        assert!(
+            mid_flight > 0,
+            "expected processed() to have advanced mid-sleep, got {mid_flight}"
+        );
+
+        let result = handle.join().expect("worker thread panicked");
+        assert!(result.is_ok());
+        assert!(control.processed() >= mid_flight);
     }
 
     #[test]
