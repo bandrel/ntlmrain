@@ -219,10 +219,17 @@ async fn real_client_lookup_round_trip_anonymous_and_authenticated() {
     );
 
     // --- Authenticated server, same fixture, fresh port. ---
+    // Uses `--auth-password-file` (the intended production credential
+    // mechanism per config.rs's own comments), not `auth_password` (the
+    // env-var fallback) -- with a trailing newline, the way a
+    // `echo hunter2 > pw` file would actually look, so this also
+    // exercises `auth.rs`'s `.trim_end_matches(['\n', '\r'])`.
     let auth_dir = tempfile::tempdir().expect("tempdir");
+    let password_path = auth_dir.path().join("password");
+    std::fs::write(&password_path, "hunter2\n").expect("write password file");
     let mut auth_config = real_table_config(&fixture, auth_dir.path().to_path_buf());
     auth_config.auth_user = Some("alice".to_string());
-    auth_config.auth_password = Some("hunter2".to_string());
+    auth_config.auth_password_file = Some(password_path);
     let auth = spawn_real_app(auth_config).await;
 
     let matching_file = fixtures::encode_endpoint_file(&fixture.endpoints);
