@@ -1,6 +1,7 @@
 mod backend;
 mod config;
 mod queue;
+mod worker;
 
 use config::Config;
 

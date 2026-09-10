@@ -101,6 +101,17 @@ pub struct Config {
     )]
     pub max_match_records: u64,
 
+    /// Wall-clock time limit (in seconds) a single lookup job may run
+    /// before the worker pool cancels it as a timeout. Added by Task 3
+    /// (worker pool): Task 1 didn't name a field for this, so this is a
+    /// small additive change to the surface it defined.
+    #[arg(
+        long = "job-timeout-secs",
+        env = "NTLMRAIN_SERVER_JOB_TIMEOUT_SECS",
+        default_value_t = 900
+    )]
+    pub job_timeout_secs: u64,
+
     /// Basic auth username. Requires exactly one of `--auth-password-file`
     /// or `NTLMRAIN_SERVER_AUTH_PASSWORD` to also be set.
     #[arg(long = "auth-user", env = "NTLMRAIN_SERVER_AUTH_USER")]
@@ -236,6 +247,7 @@ mod tests {
             exact_records: 881_688,
             any_record_count: false,
             max_match_records: 8_000_000,
+            job_timeout_secs: 900,
             auth_user: None,
             auth_password_file: None,
             auth_password: None,
@@ -340,6 +352,7 @@ mod tests {
         assert_eq!(config.max_concurrent_uploads, 16);
         assert_eq!(config.exact_records, 881_688);
         assert_eq!(config.max_match_records, 8_000_000);
+        assert_eq!(config.job_timeout_secs, 900);
         assert!(!config.any_record_count);
         assert!(!config.preload_index);
         assert!(!config.lock_index);
