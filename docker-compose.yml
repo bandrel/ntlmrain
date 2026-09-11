@@ -4,6 +4,15 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # A GRTB table is one open file descriptor per shard (LocalTable::open
+    # opens every shard up front), plus the mmapped GIDX index and the
+    # SQLite connection. Docker's default nofile limit (1024, inherited from
+    # the daemon) is exhausted by any table with a few hundred shards or
+    # more -- raise it well above realistic shard counts.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - "8080:8080"
     # Network configuration for reverse-proxy scenarios:
