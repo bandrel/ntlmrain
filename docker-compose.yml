@@ -1,0 +1,78 @@
+version: "3.8"
+
+services:
+  ntlmrain-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # Network configuration for reverse-proxy scenarios:
+    # By default the service publishes port 8080 on the host. In a reverse-proxy
+    # setup (Traefik, Caddy, nginx, etc.), you will likely instead attach this
+    # service to a shared external network and drop the host port publish:
+    #
+    # networks:
+    #   - proxy-network
+    #
+    # networks:
+    #   proxy-network:
+    #     external: true
+    #
+    # Then configure your reverse proxy to reach this service by its container
+    # name or service name on that network (e.g., "ntlmrain-server:8080").
+
+    environment:
+      # Required: GRTB table shards base path (inside container)
+      # Point this at where you bind-mount your table data
+      NTLMRAIN_SERVER_DATA_BASE: /data/tables/ntlmv1
+
+      # Required: GIDX index file path (inside container)
+      NTLMRAIN_SERVER_INDEX: /data/tables/ntlmv1.gidx
+
+      # Required: directory for SQLite queue DB and jobs blob tree
+      # Must be writable; should be on a separate volume from table data
+      NTLMRAIN_SERVER_STATE_DIR: /state
+
+      # Required: bind all interfaces inside the container (not localhost)
+      # so a reverse proxy on another container/host can reach it
+      NTLMRAIN_SERVER_LISTEN: "0.0.0.0:8080"
+
+      # Optional: concurrent table-read workers (default: system CPU count)
+      # NTLMRAIN_SERVER_READ_WORKERS: 4
+
+      # Optional: preload the GIDX index into memory at startup
+      # NTLMRAIN_SERVER_PRELOAD_INDEX: "true"
+
+      # Optional: lock the index into memory (mlock) to prevent swapping
+      # NTLMRAIN_SERVER_LOCK_INDEX: "true"
+
+      # Optional: number of concurrent lookup slots (default: 2)
+      # NTLMRAIN_SERVER_LOOKUP_SLOTS: 4
+
+      # Optional: HTTP Basic auth (requires both username and password source)
+      # Uncomment both lines and set your own values; password can be set via
+      # NTLMRAIN_SERVER_AUTH_PASSWORD (env only, not a CLI flag) or
+      # NTLMRAIN_SERVER_AUTH_PASSWORD_FILE (path to file with password).
+      # When auth is configured, /api/v1/submissions* routes require credentials;
+      # /health/*, /openapi.json, /docs remain unauthenticated.
+      #
+      # NTLMRAIN_SERVER_AUTH_USER: "admin"
+      # NTLMRAIN_SERVER_AUTH_PASSWORD_FILE: "/run/secrets/ntlmrain_password"
+
+    volumes:
+      # Read-only bind-mount of table data (GRTB shards + GIDX index)
+      # Replace /path/to/your/table with the actual host path to your table
+      - /path/to/your/table:/data:ro
+
+      # Read-write volume/bind-mount for SQLite queue DB and jobs directory
+      # This must NOT be read-only and should NOT share the mount with table data
+      - ntlmrain-state:/state
+
+volumes:
+  # State directory volume for queue DB and jobs
+  # In production, you may want to use a bind-mount instead (path: /some/host/path)
+  # to ensure persistence and easy backup/access
+  ntlmrain-state:
+    driver: local

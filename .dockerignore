@@ -1,0 +1,37 @@
+# Git and version control
+.git
+.gitignore
+
+# Build artifacts and cache
+target/
+*.pdb
+
+# Rust-specific
+Cargo.lock.local
+rust-toolchain.toml.local
+
+# Test artifacts
+.superpowers/
+.pytest_cache/
+*.grtb
+*.gidx
+
+# State and data directories (test artifacts)
+state/
+*.db
+*.db-journal
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CI/CD and automation
+.github/
+.gitlab-ci.yml
+
+# Task artifacts (not needed in image)
+.docker-task/

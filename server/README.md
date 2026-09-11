@@ -68,3 +68,80 @@ stay unauthenticated.
   `TableInfo` (`records`, `blocks`, `parts`, `min_endpoint`,
   `max_endpoint`); `503` otherwise. Use this for a readiness probe --
   a service that's live but not yet ready cannot serve lookups.
+
+## Running in Docker
+
+A multi-stage Dockerfile and `docker-compose.yml` are provided at the
+repository root. Both files are designed for self-hosted deployments and
+assume you will integrate this service with your own reverse-proxy setup
+(Traefik, Caddy, nginx, etc.) — no proxy or TLS is baked in.
+
+### Building the image
+
+```sh
+docker compose build
+# or manually:
+docker build -t ntlmrain-server .
+```
+
+**Important:** The service must be built with the `release-server` profile
+to enable panic recovery (see the ["Building"](#building) section above).
+The Dockerfile enforces this via `cargo build --profile release-server`.
+Do not attempt to bypass this or build with plain `--release`.
+
+### Running the container
+
+The easiest way is to use the compose file:
+
+```sh
+docker compose up
+```
+
+Before running, edit `docker-compose.yml` to point the bind-mount at your
+actual table directory (replace `/path/to/your/table` with the real path)
+and set the `NTLMRAIN_SERVER_DATA_BASE` and `NTLMRAIN_SERVER_INDEX` paths
+if you mount the table at a different in-container location.
+
+For example, if your table is at `/mnt/tables/ntlmv1-rainbow`:
+
+```yaml
+volumes:
+  - /mnt/tables/ntlmv1-rainbow:/data:ro
+
+environment:
+  NTLMRAIN_SERVER_DATA_BASE: /data/ntlmv1
+  NTLMRAIN_SERVER_INDEX: /data/ntlmv1.gidx
+```
+
+The container exposes port 8080 and binds all interfaces
+(`NTLMRAIN_SERVER_LISTEN=0.0.0.0:8080`) to allow a reverse proxy on
+another container or host to reach it.
+
+### Reverse-proxy setup
+
+In a multi-service Docker deployment, attach this service to a shared
+external network rather than publishing the port on the host:
+
+```yaml
+services:
+  ntlmrain-server:
+    # ... (rest of config)
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    external: true
+```
+
+Then configure your reverse proxy to reach this service at
+`ntlmrain-server:8080` on the `proxy-network` network.
+
+### Authentication
+
+To enable HTTP Basic auth, set both `NTLMRAIN_SERVER_AUTH_USER` and one
+of:
+- `NTLMRAIN_SERVER_AUTH_PASSWORD_FILE` (path to a file with the password)
+- `NTLMRAIN_SERVER_AUTH_PASSWORD` (password directly, via environment only)
+
+See the `docker-compose.yml` comments for examples.
