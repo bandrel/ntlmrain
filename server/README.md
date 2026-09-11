@@ -30,12 +30,25 @@ lookups from) and `--state-dir` (holds the SQLite job queue and the
 `jobs/` input/result blob tree). Every flag also has an
 `NTLMRAIN_SERVER_*` environment variable equivalent.
 
+`--data-base` is a filename **prefix**, not a path that exists on disk.
+The server appends a shard suffix to it, so `--data-base /tables/mytable`
+is opened as `/tables/mytable.0000.grtb`, `/tables/mytable.0001.grtb`, and
+so on. Take the prefix your shard files share and drop the `.NNNN.grtb`
+tail. `--index`, by contrast, is a real file: that same prefix plus
+`.gidx`.
+
 ```sh
 cargo run --profile release-server -p ntlmrain-server -- \
-    --data-base /data/tables/ntlmv1 \
-    --index /data/tables/ntlmv1.gidx \
+    --data-base '/tables/netntlmv1_byte#7-7_0_881689x134217668' \
+    --index '/tables/netntlmv1_byte#7-7_0_881689x134217668.gidx' \
     --state-dir /var/lib/ntlmrain-server \
     --listen 0.0.0.0:8080
+```
+
+To check a prefix before starting the server, glob it:
+
+```sh
+ls '/tables/netntlmv1_byte#7-7_0_881689x134217668'.*.grtb | head
 ```
 
 See `--help` for the full flag surface (lookup concurrency, queue depth,
@@ -101,21 +114,33 @@ The easiest way is to use the compose file:
 docker compose up
 ```
 
-Before running, edit `docker-compose.yml` to point the bind-mount at your
-actual table directory (replace `/path/to/your/table` with the real path)
-and set the `NTLMRAIN_SERVER_DATA_BASE` and `NTLMRAIN_SERVER_INDEX` paths
-if you mount the table at a different in-container location.
+Before running, edit `docker-compose.yml` to point the bind-mount at the
+directory holding your shards (replace `/path/to/tables` with the real
+path) and set `NTLMRAIN_SERVER_DATA_BASE` and `NTLMRAIN_SERVER_INDEX` to
+match. The host side of the mount is the **directory containing** the
+shards, not the table itself; as described under [Running](#running),
+there is no single table file to point at.
 
-For example, if your table is at `/mnt/tables/ntlmv1-rainbow`:
+For example, for shards named
+`/srv/tables/netntlmv1_byte#7-7_0_881689x134217668.0000.grtb` and up:
 
 ```yaml
 volumes:
-  - /mnt/tables/ntlmv1-rainbow:/data:ro
+  - /srv/tables:/data:ro
 
 environment:
-  NTLMRAIN_SERVER_DATA_BASE: /data/ntlmv1
-  NTLMRAIN_SERVER_INDEX: /data/ntlmv1.gidx
+  NTLMRAIN_SERVER_DATA_BASE: "/data/netntlmv1_byte#7-7_0_881689x134217668"
+  NTLMRAIN_SERVER_INDEX: "/data/netntlmv1_byte#7-7_0_881689x134217668.gidx"
 ```
+
+A `#` in the middle of a word is part of the value rather than the start
+of a YAML comment, so quoting is only strictly required when a table name
+contains a space.
+
+The container drops to uid 1000, so the shards and the `.gidx` must be
+readable by that uid or world-readable. A root-owned `0600` table
+bind-mounts cleanly and then fails at open time, which reads as a config
+error but is a permissions one.
 
 The container exposes port 8080 and binds all interfaces
 (`NTLMRAIN_SERVER_LISTEN=0.0.0.0:8080`) to allow a reverse proxy on
