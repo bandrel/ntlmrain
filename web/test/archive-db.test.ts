@@ -16,7 +16,7 @@ function sampleRecord(overrides: Partial<RunRecord> = {}): RunRecord {
     selected_device: { vendor: "test-vendor", limits: { maxBufferSize: 1024 } },
     tuning: null,
     outputs: { "des1.endpoints": "881688 endpoints (not persisted)" },
-    result: { matched: false, des1Keys: [], des2Keys: [], pt3Hex: null, ntHashesHex: [] },
+    result: { matched: false, des1: [], des2: [], pt3Hex: null, ntHashesHex: [] },
     ...overrides,
   };
 }
@@ -52,7 +52,13 @@ describe("archive/db.ts", () => {
     const older = sampleRecord({ created_at: "2024-01-01T00:00:00.000Z" });
     const newer = sampleRecord({
       created_at: "2024-06-01T00:00:00.000Z",
-      result: { matched: true, des1Keys: ["1"], des2Keys: ["2"], pt3Hex: "aa", ntHashesHex: ["deadbeef"] },
+      result: {
+        matched: true,
+        des1: [{ plaintextHex: "01020304050607", keyHex: "0102030405060709" }],
+        des2: [],
+        pt3Hex: "aa",
+        ntHashesHex: ["deadbeef"],
+      },
     });
     await putRun(older);
     await putRun(newer);

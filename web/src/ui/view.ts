@@ -1,12 +1,16 @@
 // DOM rendering for the recovery page. Every function here takes already-
-// looked-up elements and plain data — no orchestrator/GPU/archive imports —
-// so `main.ts` is the only place that wires this to the real pipeline.
+// looked-up elements and plain data — no GPU/orchestrator-*wiring* imports;
+// `main.ts` is the only place that builds the real ports/device/archive
+// plumbing. `key-format.ts` (byte7-index -> plaintext/key, via Task 2's
+// crypto-wasm) is a pure, already-initialized-by-the-time-we-render
+// dependency, not a wiring one, so it's fine to use directly here.
 
 import type { DesSlot } from "../pipeline/orchestrator";
 import type { RunSnapshot, SlotSnapshot } from "./run-controller";
 import type { ValidationResult } from "./validation";
 import { targetKindLabel } from "./validation";
 import { ProgressMeter, type MeterSnapshot } from "./progress-meter";
+import { recoveredKeysFromIndices, toHex } from "./key-format";
 import type { RunRecord, RunSummary } from "../archive/db";
 
 // ---------------------------------------------------------------------------
@@ -171,56 +175,67 @@ export class ProgressView {
 // Results
 // ---------------------------------------------------------------------------
 
-function hex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+/**
+ * Every string interpolated here can originate outside this code (a
+ * malicious/compromised lookup service's error `detail`, or crypto-wasm
+ * output derived from attacker-influenced wire bytes), so this builds real
+ * DOM nodes via `textContent` throughout rather than any `innerHTML`
+ * template-string concatenation — the latter would be a stored-XSS vector
+ * the moment an untrusted string reached it.
+ */
+function roleList(label: string, values: string[]): HTMLElement {
+  const dl = document.createElement("dl");
+  dl.className = "nr-results-role";
+  const dt = document.createElement("dt");
+  dt.textContent = label;
+  dl.appendChild(dt);
+  for (const value of values) {
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    dl.appendChild(dd);
+  }
+  return dl;
 }
 
-function bigintHex(value: bigint, byteLength: number): string {
-  return value.toString(16).padStart(byteLength * 2, "0");
+function paragraph(className: string, text: string): HTMLElement {
+  const p = document.createElement("p");
+  p.className = className;
+  p.textContent = text;
+  return p;
 }
 
 export function renderResults(panel: HTMLElement, body: HTMLElement, snapshot: RunSnapshot): void {
+  body.innerHTML = "";
   if (snapshot.status !== "done" && snapshot.status !== "no-match" && snapshot.status !== "error") {
     panel.hidden = true;
-    body.innerHTML = "";
     return;
   }
   panel.hidden = false;
 
   if (snapshot.status === "error") {
-    body.innerHTML = `<p class="nr-no-match">Run failed: ${snapshot.errorMessage ?? "unknown error"}</p>`;
+    body.appendChild(paragraph("nr-no-match", `Run failed: ${snapshot.errorMessage ?? "unknown error"}`));
     return;
   }
   if (snapshot.status === "no-match" || !snapshot.result) {
-    body.innerHTML = `<p class="nr-no-match">No match found in this table.</p>`;
+    body.appendChild(paragraph("nr-no-match", "No match found in this table."));
     return;
   }
 
   const result = snapshot.result;
-  const parts: string[] = [];
-  parts.push(
-    `<dl class="nr-results-role"><dt>DES1 key(s)</dt>${result.des1Keys
-      .map((key) => `<dd>${bigintHex(key, 7)}</dd>`)
-      .join("")}</dl>`,
-  );
+  const des1 = recoveredKeysFromIndices(result.des1Keys);
+  body.appendChild(roleList("DES1 plaintext(s)", des1.map((entry) => toHex(entry.plaintext))));
+  body.appendChild(roleList("DES1 key(s)", des1.map((entry) => toHex(entry.key))));
   if (result.des2Keys.length > 0) {
-    parts.push(
-      `<dl class="nr-results-role"><dt>DES2 key(s)</dt>${result.des2Keys
-        .map((key) => `<dd>${bigintHex(key, 7)}</dd>`)
-        .join("")}</dl>`,
-    );
+    const des2 = recoveredKeysFromIndices(result.des2Keys);
+    body.appendChild(roleList("DES2 plaintext(s)", des2.map((entry) => toHex(entry.plaintext))));
+    body.appendChild(roleList("DES2 key(s)", des2.map((entry) => toHex(entry.key))));
   }
   if (result.pt3 !== null) {
-    parts.push(`<dl class="nr-results-role"><dt>DES3 plaintext</dt><dd>${hex(result.pt3)}</dd></dl>`);
+    body.appendChild(roleList("DES3 plaintext", [toHex(result.pt3)]));
   }
   if (result.ntHashes.length > 0) {
-    parts.push(
-      `<dl class="nr-results-role"><dt>Assembled NT hash(es)</dt>${result.ntHashes
-        .map((entry) => `<dd>${hex(entry.ntHash)}</dd>`)
-        .join("")}</dl>`,
-    );
+    body.appendChild(roleList("Assembled NT hash(es)", result.ntHashes.map((entry) => toHex(entry.ntHash))));
   }
-  body.innerHTML = parts.join("");
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import {
   type GpuSettingsState,
 } from "./ui/gpu-settings";
 import { validateInput } from "./ui/validation";
+import { recoveredKeysFromIndices } from "./ui/key-format";
 import { RunController, type RunSnapshot } from "./ui/run-controller";
 import { ProgressView, renderArchiveDetail, renderArchiveList, renderInputFeedback, renderResults } from "./ui/view";
 import {
@@ -137,18 +138,30 @@ function renderSnapshot(snapshot: RunSnapshot): void {
   startButton.disabled = snapshot.status === "running" || snapshot.status === "paused";
 }
 
+function toHexBytes(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function buildArchivedResult(
   result: Awaited<ReturnType<typeof runOrchestrator>> | null,
   matched: boolean,
 ): ArchivedResult {
+  // `result.des1Keys`/`des2Keys` are byte7 indices, not plaintext/key bytes
+  // themselves (see `ui/key-format.ts`'s module docs) — resolve them to the
+  // actual recovered plaintext + expanded DES key before archiving, so a
+  // past run's detail view shows the same thing the results panel did.
   return {
     matched,
-    des1Keys: (result?.des1Keys ?? []).map((key) => key.toString(16)),
-    des2Keys: (result?.des2Keys ?? []).map((key) => key.toString(16)),
-    pt3Hex: result?.pt3 ? Array.from(result.pt3, (byte) => byte.toString(16).padStart(2, "0")).join("") : null,
-    ntHashesHex: (result?.ntHashes ?? []).map((entry) =>
-      Array.from(entry.ntHash, (byte) => byte.toString(16).padStart(2, "0")).join(""),
-    ),
+    des1: recoveredKeysFromIndices(result?.des1Keys ?? []).map((entry) => ({
+      plaintextHex: toHexBytes(entry.plaintext),
+      keyHex: toHexBytes(entry.key),
+    })),
+    des2: recoveredKeysFromIndices(result?.des2Keys ?? []).map((entry) => ({
+      plaintextHex: toHexBytes(entry.plaintext),
+      keyHex: toHexBytes(entry.key),
+    })),
+    pt3Hex: result?.pt3 ? toHexBytes(result.pt3) : null,
+    ntHashesHex: (result?.ntHashes ?? []).map((entry) => toHexBytes(entry.ntHash)),
   };
 }
 

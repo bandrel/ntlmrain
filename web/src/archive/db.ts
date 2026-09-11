@@ -50,10 +50,17 @@ export interface ArchivedDevice {
   limits: Record<string, number>;
 }
 
+export interface ArchivedRecoveredKey {
+  /** Hex of the recovered 7-byte plaintext (the password guess), not the raw byte7 index. */
+  plaintextHex: string;
+  /** Hex of the expanded 8-byte DES key (parity bits set) derived from `plaintextHex`. */
+  keyHex: string;
+}
+
 export interface ArchivedResult {
   matched: boolean;
-  des1Keys: string[];
-  des2Keys: string[];
+  des1: ArchivedRecoveredKey[];
+  des2: ArchivedRecoveredKey[];
   pt3Hex: string | null;
   ntHashesHex: string[];
   errorMessage?: string;
