@@ -34,6 +34,11 @@ cd ..
 cargo run -p server -- --static-dir web/dist [other server flags...]
 ```
 
+To get the same result without a local Rust/Node toolchain, build the
+project's Docker image instead: it runs both steps above in dedicated build
+stages and serves the output automatically (see `server/README.md`'s "Static
+assets" section). The manual sequence above is for iterating on the UI.
+
 `web/dist/` is a plain static site — any `ntlmrain-server` invocation with
 `--static-dir web/dist` will serve it at `/`, alongside the existing
 `/api/v1/*` routes, health checks, and OpenAPI docs (see `server/README.md`'s

@@ -58,6 +58,11 @@ validation limits, job timeout, and `--static-dir` for serving static web assets
 
 To serve a web UI or other static assets, pass `--static-dir /path/to/web/dist`. Files in that directory are served at `/` alongside the API routes (`/api/v1/*`), health checks, and OpenAPI documentation. See `web/README.md` for how to build the bundled browser WebGPU UI into a `web/dist` directory suitable for this flag.
 
+The Docker image does this for you: it builds `crypto-wasm` with `wasm-pack`
+and the UI with Vite, ships the result at `/usr/share/ntlmrain/web`, and sets
+`NTLMRAIN_SERVER_STATIC_DIR` to point there. A container started from it
+serves the UI at `/` with no extra configuration.
+
 ## Auth
 
 Anonymous access is allowed unless both `--auth-user` and a password

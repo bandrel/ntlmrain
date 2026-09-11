@@ -51,6 +51,13 @@ services:
       # Must be writable; should be on a separate volume from table data
       NTLMRAIN_SERVER_STATE_DIR: /state
 
+      # Optional: directory of static web assets served at /.
+      # The image already builds the browser UI and bakes this in, so the
+      # service comes up with a working UI at http://<host>:8080/ and needs
+      # no setting here. Override only to serve a different bundle, e.g. a
+      # bind-mounted web/dist you are iterating on.
+      # NTLMRAIN_SERVER_STATIC_DIR: /usr/share/ntlmrain/web
+
       # Optional: concurrent table-read workers (default: system CPU count)
       # NTLMRAIN_SERVER_READ_WORKERS: 4
 

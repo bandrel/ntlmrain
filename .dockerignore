@@ -35,3 +35,13 @@ state/
 
 # Task artifacts (not needed in image)
 .docker-task/
+
+# Web build inputs/outputs that the image regenerates itself.
+# These must be excluded, not merely ignored: if a stale host-built
+# crypto-wasm/pkg or web/dist were copied into the context, it would be
+# layered over the freshly built one and shipped instead of it.
+node_modules/
+web/node_modules/
+web/dist/
+web/public/shaders/
+crypto-wasm/pkg/
