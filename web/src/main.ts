@@ -11,6 +11,7 @@ import {
   precomputeExpandedSource,
   runPrecompute,
 } from "./webgpu/precompute";
+import { verifyCompactSource, verifyExpandedSource } from "./webgpu/false-alarm";
 import { initCrypto } from "./crypto";
 import { createDefaultPorts, runOrchestrator, type OrchestratorPorts } from "./pipeline/orchestrator";
 import { autoTuneDevice, validWorkgroups, type TuningSelection } from "./webgpu/tuning";
@@ -245,14 +246,14 @@ function buildPorts(
       device,
       precomputeCompactSource,
       precomputeExpandedSource,
-      // There is no GPU-based false-alarm/verify shader pipeline in this
-      // codebase (browser-side verification runs through crypto-wasm's
-      // serial WASM port instead — see `pipeline/orchestrator.ts`), so there
-      // is no real source text to digest for these two fields. Left as
-      // empty strings deliberately, not fabricated placeholder content;
-      // building that GPU verify pipeline is out of scope for this fix wave.
-      falseAlarmCompactSource: "",
-      falseAlarmExpandedSource: "",
+      // As of Task 8, verification also runs a real GPU pipeline
+      // (`webgpu/false-alarm.ts`, compiled from the same tuned
+      // shader/workgroup as precompute) rather than crypto-wasm's serial
+      // WASM path, so its shipped WGSL sources belong in the cache key too
+      // — a changed verify shader should invalidate a previously-cached
+      // tuning selection exactly like a changed precompute shader does.
+      falseAlarmCompactSource: verifyCompactSource,
+      falseAlarmExpandedSource: verifyExpandedSource,
       desLutBytes: lutBytes,
     },
     lookupConfig: { baseUrl: window.location.origin },

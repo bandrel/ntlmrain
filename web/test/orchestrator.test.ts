@@ -56,7 +56,7 @@ function fakePorts(overrides: Partial<OrchestratorPorts> = {}): {
       calls.push("decodeCandidateFile");
       return [{ position: 0n, start: 42n }];
     },
-    verifyCandidates: (_candidates, _target, _stopAtFirst, onProgress) => {
+    verifyCandidates: async (_candidates, _target, _stopAtFirst, _tuning, onProgress) => {
       calls.push("verifyCandidates");
       onProgress?.({ candidatesDone: 1n, candidatesTotal: 1n, stepsDone: 1n, stepsTotal: 1n, verifiedKeys: 1n });
       return { keys: [123n] };
@@ -152,7 +152,7 @@ describe("runOrchestrator sequencing", () => {
         onEvent?.({ type: "submitted", submissionToken: "token", pollWithinSeconds: 1 });
         return new Uint8Array([9, 9]);
       },
-      verifyCandidates: (_candidates, _target, _stopAtFirst) => {
+      verifyCandidates: async (_candidates, _target, _stopAtFirst) => {
         calls.push("verifyCandidates");
         if (lookupsCompleted < 2) {
           verifyStartedBeforeBothLookupsCompleted = true;
@@ -183,7 +183,7 @@ describe("runOrchestrator sequencing", () => {
 
   it("stops after the first des1xdes2 pair unless findAll is set", async () => {
     const { ports } = fakePorts({
-      verifyCandidates: (_candidates, _target, _stopAtFirst) => ({ keys: [1n, 2n] }),
+      verifyCandidates: async (_candidates, _target, _stopAtFirst) => ({ keys: [1n, 2n] }),
     });
 
     const stopsAtFirst = await runOrchestrator(RESPONSE, ports);
@@ -196,7 +196,7 @@ describe("runOrchestrator sequencing", () => {
 
   it("emits a no-match event when des1 verification finds nothing", async () => {
     const events: OrchestratorEvent[] = [];
-    const { ports } = fakePorts({ verifyCandidates: () => ({ keys: [] }) satisfies VerifyOutcome });
+    const { ports } = fakePorts({ verifyCandidates: async () => ({ keys: [] } satisfies VerifyOutcome) });
     const result = await runOrchestrator(RESPONSE, ports, { onEvent: (event) => events.push(event) });
     expect(result.des1Keys).toEqual([]);
     expect(events.some((event) => event.type === "no-match")).toBe(true);

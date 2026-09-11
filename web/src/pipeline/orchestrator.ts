@@ -18,6 +18,7 @@ import {
   encode_endpoint_file,
   decode_candidate_file,
   verify_candidates,
+  is_exact_des_key_match,
   recover_pt3,
   assemble_nt_hash,
   type VerifyProgressJs,
@@ -29,6 +30,14 @@ import {
   type PrecomputeProgress,
   type ShaderVariant,
 } from "../webgpu/precompute";
+import {
+  checkCandidatesWithProgress,
+  createFalseAlarmPipeline,
+  supportsFalseAlarmShader,
+  FALSE_ALARM_WORKGROUP_STORAGE_BYTES,
+  type FalseAlarmCandidateInput,
+  type FalseAlarmProgress,
+} from "../webgpu/false-alarm";
 import {
   autoTuneDevice,
   type AutoTuneDeviceLimits,
@@ -121,12 +130,24 @@ export interface OrchestratorPorts {
   encodeEndpointFile(endpoints: BigUint64Array): Uint8Array;
   lookup(endpointFile: Uint8Array, expectedCount: number, onEvent?: (event: LookupEvent) => void): Promise<Uint8Array>;
   decodeCandidateFile(bytes: Uint8Array, expectedQueryCount: number): CandidateRecord[];
+  /**
+   * Async as of Task 8's GPU verify port: the WASM serial verify this
+   * replaced as the default wiring was a single blocking call, but the GPU
+   * driver dispatches real `await`-ed rounds, so this had to become a
+   * `Promise`. `tuning` is threaded through (mirroring `precompute`'s own
+   * second parameter) because native's `GpuContext` compiles its
+   * false-alarm/verify pipeline from the SAME tuned shader/workgroup as
+   * precompute (`compile_pipelines` compiles both from one `TuningSelection`)
+   * — the default GPU port below relies on this to pick/cache the right
+   * verify pipeline instead of re-tuning or guessing.
+   */
   verifyCandidates(
     candidates: CandidateRecord[],
     target: Uint8Array,
     stopAtFirst: boolean,
+    tuning: TuningSelection,
     onProgress?: (progress: VerifyProgress) => void,
-  ): VerifyOutcome;
+  ): Promise<VerifyOutcome>;
   /** Empty result means "not found" (native's `Option::None`). */
   recoverPt3(target: Uint8Array): Uint8Array | null;
   assembleNtHash(pt1Index: bigint, pt2Index: bigint, pt3: Uint8Array): Uint8Array;
@@ -198,8 +219,12 @@ export async function runOrchestrator(
   const desKeys: bigint[][] = [];
   for (let index = 0; index < targets.length; index += 1) {
     const which: DesSlot = index === 0 ? "des1" : "des2";
-    const outcome = ports.verifyCandidates(candidatesBySlot[index], targets[index], !options.findAll, (progress) =>
-      options.onEvent?.({ type: "verify-progress", which, progress }),
+    const outcome = await ports.verifyCandidates(
+      candidatesBySlot[index],
+      targets[index],
+      !options.findAll,
+      tuning,
+      (progress) => options.onEvent?.({ type: "verify-progress", which, progress }),
     );
     desKeys.push(outcome.keys);
   }
@@ -371,12 +396,21 @@ function defaultDecodeCandidateFile(bytes: Uint8Array, expectedQueryCount: numbe
   return Array.from(records, (record) => ({ position: record.ordinal, start: record.start }));
 }
 
-function defaultVerifyCandidates(
+/**
+ * Serial WASM verify (Task 2's `crypto-wasm::verify_candidates_serial`),
+ * kept available as a small-batch/no-WebGPU fallback path even though it is
+ * no longer the default wiring below — see `isCacheableTuningSource`-style
+ * doc comment on `createDefaultPorts` for why. `tuning` is accepted (and
+ * ignored) purely so this has the identical `OrchestratorPorts.verifyCandidates`
+ * shape as `defaultVerifyCandidates` and the two are interchangeable.
+ */
+export async function wasmVerifyCandidates(
   candidates: CandidateRecord[],
   target: Uint8Array,
   stopAtFirst: boolean,
+  _tuning: TuningSelection,
   onProgress?: (progress: VerifyProgress) => void,
-): VerifyOutcome {
+): Promise<VerifyOutcome> {
   const starts = new BigUint64Array(candidates.map((candidate) => candidate.start));
   const positions = new Uint32Array(candidates.map((candidate) => Number(candidate.position)));
   const outcome = verify_candidates(starts, positions, target, TABLE_INDEX, stopAtFirst, (progress: VerifyProgressJs) => {
@@ -389,6 +423,80 @@ function defaultVerifyCandidates(
     });
   });
   return { keys: Array.from(outcome.keys, BigInt) };
+}
+
+/**
+ * GPU-based verify (Task 8's port of `src/gpu.rs`'s
+ * `check_candidates_with_progress`) — the default wiring below. A real
+ * lookup returns millions of candidates (Task 7 measured 2,967,049 in a
+ * real run), which `wasmVerifyCandidates` above cannot finish checking in
+ * any practical browser-tab time; this is the actual fix.
+ *
+ * Reuses the SAME shader/workgroup `tuning` picked for precompute (native's
+ * `GpuContext::create` compiles both pipelines from one `TuningSelection`;
+ * see the `OrchestratorPorts.verifyCandidates` doc comment) rather than
+ * re-tuning independently for verify.
+ */
+function defaultVerifyCandidatesGpu(
+  options: DefaultPortsOptions,
+  falseAlarmPipelineCache: Map<string, GPUComputePipeline>,
+): OrchestratorPorts["verifyCandidates"] {
+  return async (candidates, target, stopAtFirst, tuning, onProgress) => {
+    if (candidates.length === 0) return { keys: [] };
+
+    if (!supportsFalseAlarmShader(options.device, tuning.shader)) {
+      // Fail loudly rather than silently falling back to a slower path or
+      // producing a confusing WebGPU validation error deep inside a
+      // dispatch — the false-alarm/verify shader's workgroup-storage need
+      // is 4 bytes larger than the precompute shader of the same variant
+      // (see `FALSE_ALARM_WORKGROUP_STORAGE_BYTES`'s doc comment), so a
+      // device that tuned to this shader for precompute can still be just
+      // short of what verify needs.
+      throw new Error(
+        `device's maxComputeWorkgroupStorageSize (${options.device.limits.maxComputeWorkgroupStorageSize}) is ` +
+          `insufficient for the "${tuning.shader}" false-alarm verify shader (needs ` +
+          `${FALSE_ALARM_WORKGROUP_STORAGE_BYTES[tuning.shader]} bytes)`,
+      );
+    }
+
+    const cacheKey = `${tuning.shader}:${tuning.workgroupSize}`;
+    let pipeline = falseAlarmPipelineCache.get(cacheKey);
+    if (!pipeline) {
+      pipeline = createFalseAlarmPipeline(options.device, tuning.shader, tuning.workgroupSize);
+      falseAlarmPipelineCache.set(cacheKey, pipeline);
+    }
+
+    const inputs: FalseAlarmCandidateInput[] = candidates.map((candidate) => ({
+      start: candidate.start,
+      position: Number(candidate.position),
+    }));
+
+    const recovered = await checkCandidatesWithProgress(
+      options.device,
+      pipeline,
+      options.lutBuffer,
+      options.precomputeDeviceLimits,
+      tuning.workgroupSize,
+      inputs,
+      {
+        target,
+        tableIndex: TABLE_INDEX,
+        findAll: !stopAtFirst,
+        verifyExact: is_exact_des_key_match,
+        onProgress: (progress: FalseAlarmProgress) => {
+          onProgress?.({
+            candidatesDone: BigInt(candidates.length - progress.activeCandidates),
+            candidatesTotal: BigInt(candidates.length),
+            stepsDone: progress.completedSteps,
+            stepsTotal: progress.totalSteps,
+            verifiedKeys: BigInt(progress.acceptedHits),
+          });
+        },
+      },
+    );
+
+    return { keys: recovered };
+  };
 }
 
 function defaultRecoverPt3(target: Uint8Array): Uint8Array | null {
@@ -410,6 +518,7 @@ function defaultAssembleNtHash(pt1Index: bigint, pt2Index: bigint, pt3: Uint8Arr
  */
 export function createDefaultPorts(options: DefaultPortsOptions): OrchestratorPorts {
   const pipelineCache = new Map<string, GPUComputePipeline>();
+  const falseAlarmPipelineCache = new Map<string, GPUComputePipeline>();
   return {
     getTuning: () => defaultGetTuning(options),
     precompute: defaultPrecompute(options, pipelineCache),
@@ -417,7 +526,14 @@ export function createDefaultPorts(options: DefaultPortsOptions): OrchestratorPo
     lookup: (endpointFile, expectedCount, onEvent) =>
       defaultLookup(options.lookupConfig, endpointFile, expectedCount, onEvent),
     decodeCandidateFile: defaultDecodeCandidateFile,
-    verifyCandidates: defaultVerifyCandidates,
+    // The GPU driver is the default: every caller of `createDefaultPorts`
+    // already supplies a `GPUDevice` (required for precompute too), so
+    // there is no scenario where a real production run has a device for
+    // precompute but not for verify. `wasmVerifyCandidates` remains
+    // exported above for a caller that explicitly wants the small-batch/
+    // no-WebGPU serial path instead (e.g. tests, or a future manual
+    // override) — swap it in via `ports.verifyCandidates = wasmVerifyCandidates`.
+    verifyCandidates: defaultVerifyCandidatesGpu(options, falseAlarmPipelineCache),
     recoverPt3: defaultRecoverPt3,
     assembleNtHash: defaultAssembleNtHash,
   };

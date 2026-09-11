@@ -35,7 +35,7 @@ function fakePorts(): OrchestratorPorts {
       return new Uint8Array(0);
     },
     decodeCandidateFile: () => [{ position: 0n, start: 1n }],
-    verifyCandidates: (_candidates, _target, _stopAtFirst, onProgress) => {
+    verifyCandidates: async (_candidates, _target, _stopAtFirst, _tuning, onProgress) => {
       onProgress?.({ candidatesDone: 1n, candidatesTotal: 1n, stepsDone: 1n, stepsTotal: 1n, verifiedKeys: 1n });
       return { keys: [42n] };
     },
@@ -52,7 +52,7 @@ async function flush(turns = 10): Promise<void> {
 }
 
 function noMatchPorts(): OrchestratorPorts {
-  return { ...fakePorts(), verifyCandidates: () => ({ keys: [] }) };
+  return { ...fakePorts(), verifyCandidates: async () => ({ keys: [] }) };
 }
 
 describe("RunController", () => {

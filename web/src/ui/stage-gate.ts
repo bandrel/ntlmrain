@@ -5,21 +5,29 @@
 // right before each of precompute/lookup/verify, per DES slot, until the UI
 // calls `resume()`.
 //
-// `OrchestratorPorts.precompute`/`lookup` are the only two port methods
-// `runOrchestrator` awaits before its next step (`decodeCandidateFile` and
-// `verifyCandidates` are synchronous — see `pipeline/orchestrator.ts`), so
-// this is the only place a pause can actually be inserted without changing
-// that file: pausing at the top of `lookup` gates entry to the lookup
-// stage, and pausing again right after `lookup`'s promise resolves (but
-// before returning to the orchestrator, which immediately calls
-// `decodeCandidateFile`/`verifyCandidates` next) gates entry to the verify
-// stage.
+// `runOrchestrator`'s structure (after Task 7's fix wave and Task 8's GPU
+// verify port) is two passes, not one per-slot loop:
+//   pass 1: des1's precompute -> lookup, THEN des2's precompute -> lookup
+//           (verify is NOT called here at all);
+//   pass 2: des1's verify, THEN des2's verify (only after BOTH slots'
+//           lookups in pass 1 have fully resolved).
+// `precompute`, `lookup`, and (as of Task 8) `verifyCandidates` are now all
+// async port methods `runOrchestrator` awaits, so each gets its own pause
+// point below, gating entry to that stage — there is no need to piggyback
+// the verify pause onto the end of `lookup` the way an earlier revision of
+// this file did (stale once verify moved into its own pass: pausing inside
+// `lookup` would have gated des1's verify immediately after des1's lookup,
+// long before des1's verify pass actually runs, and would have said nothing
+// about des2's verify pause at all). The pause point sits at the very top
+// of the wrapped `verifyCandidates`, before any dispatch begins, so
+// manual-stepping mode genuinely blocks dispatch rather than pausing
+// somewhere mid-run or after the fact.
 //
-// `precompute`/`lookup` are called exactly once per DES slot, strictly in
-// des1-then-des2 order (`runOrchestrator`'s documented sequencing), so a
-// simple call counter is enough to label which slot is currently gating —
-// there is no need for the orchestrator to pass `which` into the ports
-// themselves.
+// `precompute`/`lookup`/`verifyCandidates` are each called exactly once per
+// DES slot, strictly in des1-then-des2 order within their own pass
+// (`runOrchestrator`'s documented sequencing), so a simple per-method call
+// counter is enough to label which slot is currently gating — there is no
+// need for the orchestrator to pass `which` into the ports themselves.
 
 import type { DesSlot, OrchestratorPorts } from "../pipeline/orchestrator";
 
@@ -88,14 +96,14 @@ export class StageGate {
 }
 
 /**
- * Wrap a real `OrchestratorPorts` so `precompute`/`lookup` pause on `gate`
- * before running, and the pipeline additionally pauses on `gate` again right
- * after a slot's lookup resolves (i.e. before verification starts).
+ * Wrap a real `OrchestratorPorts` so `precompute`, `lookup`, and (in its own
+ * later pass) `verifyCandidates` each pause on `gate` before running.
  */
 export function wrapPortsWithGate(ports: OrchestratorPorts, gate: StageGate): OrchestratorPorts {
   const slotOrder: DesSlot[] = ["des1", "des2"];
   let precomputeCalls = 0;
   let lookupCalls = 0;
+  let verifyCalls = 0;
 
   const slotFor = (callIndex: number): DesSlot => slotOrder[Math.min(callIndex, slotOrder.length - 1)];
 
@@ -111,9 +119,13 @@ export function wrapPortsWithGate(ports: OrchestratorPorts, gate: StageGate): Or
       const which = slotFor(lookupCalls);
       lookupCalls += 1;
       await gate.wait("lookup", which);
-      const bytes = await ports.lookup(endpointFile, expectedCount, onEvent);
+      return ports.lookup(endpointFile, expectedCount, onEvent);
+    },
+    verifyCandidates: async (candidates, target, stopAtFirst, tuning, onProgress) => {
+      const which = slotFor(verifyCalls);
+      verifyCalls += 1;
       await gate.wait("verify", which);
-      return bytes;
+      return ports.verifyCandidates(candidates, target, stopAtFirst, tuning, onProgress);
     },
   };
 }

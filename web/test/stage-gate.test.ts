@@ -31,7 +31,7 @@ function fakePorts(): { ports: OrchestratorPorts; calls: string[] } {
       return new Uint8Array(0);
     },
     decodeCandidateFile: () => [],
-    verifyCandidates: () => {
+    verifyCandidates: async () => {
       calls.push("verifyCandidates");
       return { keys: [] };
     },
@@ -90,7 +90,7 @@ describe("StageGate", () => {
 });
 
 describe("wrapPortsWithGate", () => {
-  it("pauses at precompute, then lookup, then verify, labeling des1 before des2", async () => {
+  it("pauses at precompute, then lookup (no verify gate attached), labeling des1 before des2", async () => {
     const gate = new StageGate(false);
     const { ports, calls } = fakePorts();
     const wrapped = wrapPortsWithGate(ports, gate);
@@ -104,17 +104,16 @@ describe("wrapPortsWithGate", () => {
     await precomputePromise;
     expect(calls).toEqual(["precompute"]);
 
-    // --- des1's lookup, then its post-lookup verify gate ---
+    // --- des1's lookup: gates on entry, but resolves without any further
+    // gate (verify no longer piggybacks on lookup's completion — it runs
+    // in its own later pass, per the module doc comment). ---
     const lookupPromise = wrapped.lookup(new Uint8Array(0), 1);
     await Promise.resolve();
     expect(gate.waiting).toEqual({ stage: "lookup", which: "des1" });
     gate.resume();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(calls).toEqual(["precompute", "lookup"]);
-    expect(gate.waiting).toEqual({ stage: "verify", which: "des1" });
-    gate.resume();
     await lookupPromise;
+    expect(calls).toEqual(["precompute", "lookup"]);
+    expect(gate.waiting).toBeNull();
 
     // --- des2's precompute is labeled des2, not des1 ---
     const secondPrecompute = wrapped.precompute(new Uint8Array(8), baseTuning());
@@ -124,6 +123,27 @@ describe("wrapPortsWithGate", () => {
     await secondPrecompute;
   });
 
+  it("pauses verifyCandidates before dispatch, independently of lookup, labeling des1 before des2", async () => {
+    const gate = new StageGate(false);
+    const { ports, calls } = fakePorts();
+    const wrapped = wrapPortsWithGate(ports, gate);
+
+    const firstVerify = wrapped.verifyCandidates([], new Uint8Array(8), true, baseTuning());
+    await Promise.resolve();
+    expect(calls).toEqual([]);
+    expect(gate.waiting).toEqual({ stage: "verify", which: "des1" });
+    gate.resume();
+    await firstVerify;
+    expect(calls).toEqual(["verifyCandidates"]);
+
+    const secondVerify = wrapped.verifyCandidates([], new Uint8Array(8), true, baseTuning());
+    await Promise.resolve();
+    expect(gate.waiting).toEqual({ stage: "verify", which: "des2" });
+    gate.resume();
+    await secondVerify;
+    expect(calls).toEqual(["verifyCandidates", "verifyCandidates"]);
+  });
+
   it("never pauses when continuing automatically, and calls through in order", async () => {
     const gate = new StageGate(true);
     const { ports, calls } = fakePorts();
@@ -131,6 +151,7 @@ describe("wrapPortsWithGate", () => {
 
     await wrapped.precompute(new Uint8Array(8), baseTuning());
     await wrapped.lookup(new Uint8Array(0), 1);
-    expect(calls).toEqual(["precompute", "lookup"]);
+    await wrapped.verifyCandidates([], new Uint8Array(8), true, baseTuning());
+    expect(calls).toEqual(["precompute", "lookup", "verifyCandidates"]);
   });
 });

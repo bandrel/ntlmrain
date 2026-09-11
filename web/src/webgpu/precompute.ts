@@ -426,8 +426,12 @@ export interface PrecomputeDeviceLimits {
 
 /** Mirrors `ensure_storage_size` in src/gpu.rs: fail fast with a clear
  * message instead of letting `device.createBuffer`/`createBindGroup` throw
- * an opaque validation error deep inside the dispatch loop. */
-function ensureStorageSize(limits: PrecomputeDeviceLimits, bytes: number, label: string): void {
+ * an opaque validation error deep inside the dispatch loop.
+ *
+ * Exported so `webgpu/false-alarm.ts` (Task 8's verify driver, which needs
+ * the identical check for its single persistent candidate-state buffer) can
+ * reuse this instead of re-deriving it. */
+export function ensureStorageSize(limits: PrecomputeDeviceLimits, bytes: number, label: string): void {
   if (bytes > limits.maxBufferSize) {
     throw new Error(`${label} needs ${bytes} bytes; device max buffer size is ${limits.maxBufferSize}`);
   }
