@@ -8,11 +8,14 @@
 //   POST /api/v1/submissions/result   - download the NTLMCAN1 result
 //   POST /api/v1/submissions/cancel   - best-effort cancel
 //
-// Deliberately NOT ported here: `validate_token` (256-bit lowercase hex
-// submission-token shape check) and the artifact-format validation
-// (`parse_endpoint_file`/`validate_candidate_file`) — those depend on
-// Task 2's `crypto-wasm` formats module, which is this client's caller's
-// concern (`pipeline/orchestrator.ts`), not this HTTP-transport layer's.
+// `validate_token` (256-bit lowercase hex submission-token shape check) IS
+// ported here (`validateSubmissionToken`, called from `submit` right after
+// parsing the receipt, and again at the top of `cancel` — the same two call
+// sites as native's `remote_lookup.rs:204`/`:220`): it has no crypto-wasm
+// dependency, unlike the artifact-format validation
+// (`parse_endpoint_file`/`validate_candidate_file`), which DOES depend on
+// Task 2's `crypto-wasm` formats module and is deliberately left to this
+// client's caller (`pipeline/orchestrator.ts`) instead.
 
 export interface LookupClientConfig {
   /** e.g. `https://lookup.ntlmrain.com`; trailing slashes are tolerated. */
@@ -55,6 +58,24 @@ export class LookupServiceError extends Error {
 const KNOWN_STATES = new Set(["queued", "running", "ready", "failed"]);
 
 /**
+ * Port of `validate_token`: the capability token must be exactly 64
+ * lowercase-hex characters (256 bits). Native calls this immediately after
+ * parsing a submission receipt (`remote_lookup.rs:204`) and again at the
+ * top of its public `cancel` (`:220`) — this is the security boundary that
+ * stops a malicious/compromised lookup service from echoing an arbitrary
+ * string back as a "capability token" that then gets replayed into every
+ * subsequent status/result/cancel request body.
+ */
+function validateSubmissionToken(token: string): void {
+  const isValid =
+    token.length === 64 &&
+    Array.from(token).every((character) => (character >= "0" && character <= "9") || (character >= "a" && character <= "f"));
+  if (!isValid) {
+    throw new LookupServiceError("submission token is not 256-bit lowercase hexadecimal");
+  }
+}
+
+/**
  * `POST {base}/api/v1/submissions`: raw NTLMEND1 bytes,
  * `Content-Type: application/vnd.netntlmv1.endpoints`.
  */
@@ -72,6 +93,7 @@ export async function submit(config: LookupClientConfig, endpointBytes: Uint8Arr
   if (typeof json.submission_token !== "string") {
     throw new LookupServiceError("lookup service response is missing submission_token");
   }
+  validateSubmissionToken(json.submission_token);
   return {
     submissionToken: json.submission_token,
     pollWithinSeconds: typeof json.poll_within_seconds === "number" ? json.poll_within_seconds : null,
@@ -188,6 +210,7 @@ export async function result(config: LookupClientConfig, submissionToken: string
  */
 export async function cancel(config: LookupClientConfig, submissionToken: string): Promise<void> {
   try {
+    validateSubmissionToken(submissionToken);
     await doFetch(config, "/api/v1/submissions/cancel", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

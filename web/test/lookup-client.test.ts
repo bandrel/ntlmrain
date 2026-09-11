@@ -76,6 +76,27 @@ describe("submit", () => {
       message: "Service Unavailable",
     });
   });
+
+  it("rejects a non-hex submission_token", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ submission_token: "z".repeat(64) })) as unknown as typeof fetch;
+    await expect(submit(config(fetchImpl), new Uint8Array([1]))).rejects.toThrow(
+      /submission token is not 256-bit lowercase hexadecimal/,
+    );
+  });
+
+  it("rejects a wrong-length submission_token", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ submission_token: "a".repeat(63) })) as unknown as typeof fetch;
+    await expect(submit(config(fetchImpl), new Uint8Array([1]))).rejects.toThrow(
+      /submission token is not 256-bit lowercase hexadecimal/,
+    );
+  });
+
+  it("rejects an uppercase-hex submission_token", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ submission_token: "A".repeat(64) })) as unknown as typeof fetch;
+    await expect(submit(config(fetchImpl), new Uint8Array([1]))).rejects.toThrow(
+      /submission token is not 256-bit lowercase hexadecimal/,
+    );
+  });
 });
 
 describe("status", () => {
@@ -210,21 +231,35 @@ describe("result", () => {
 });
 
 describe("cancel", () => {
+  const validToken = "a".repeat(64);
+
   it("swallows network errors (best-effort, fire-and-forget)", async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error("network down");
     }) as unknown as typeof fetch;
-    await expect(cancel(config(fetchImpl), "token")).resolves.toBeUndefined();
+    await expect(cancel(config(fetchImpl), validToken)).resolves.toBeUndefined();
   });
 
   it("swallows a non-2xx response", async () => {
     const fetchImpl = vi.fn(async () => new Response("", { status: 500 })) as unknown as typeof fetch;
-    await expect(cancel(config(fetchImpl), "token")).resolves.toBeUndefined();
+    await expect(cancel(config(fetchImpl), validToken)).resolves.toBeUndefined();
   });
 
   it("still issues the request when it succeeds", async () => {
     const fetchImpl = vi.fn(async () => new Response("", { status: 204 })) as unknown as typeof fetch;
-    await cancel(config(fetchImpl), "token");
+    await cancel(config(fetchImpl), validToken);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a non-hex, wrong-length, or uppercase-hex token before ever issuing a request", async () => {
+    const fetchImpl = vi.fn(async () => new Response("", { status: 204 })) as unknown as typeof fetch;
+    for (const badToken of ["z".repeat(64), "a".repeat(63), "A".repeat(64)]) {
+      // eslint-disable-next-line no-await-in-loop
+      await expect(cancel(config(fetchImpl), badToken)).resolves.toBeUndefined();
+    }
+    // Validation fails before `doFetch`, and the failure is swallowed
+    // (matching this file's single best-effort `cancel`), so no request is
+    // ever sent for any of the three invalid tokens.
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
