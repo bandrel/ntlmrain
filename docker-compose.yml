@@ -31,12 +31,21 @@ services:
     # name or service name on that network (e.g., "ntlmrain-server:8080").
 
     environment:
-      # Required: GRTB table shards base path (inside container)
-      # Point this at where you bind-mount your table data
-      NTLMRAIN_SERVER_DATA_BASE: /data/ntlmv1
+      # Required: GRTB table shards base path (inside container).
+      #
+      # This is a filename PREFIX, not a directory and not a file that exists
+      # on disk. The server appends a shard suffix to it, so a base path of
+      # /data/mytable is opened as /data/mytable.0000.grtb, .0001.grtb, and so
+      # on. Take the prefix your shards share, drop the ".NNNN.grtb" tail, and
+      # rewrite the host directory to wherever you bind-mount it below.
+      #
+      # Quoting matters only if your table name contains a space; a "#" in the
+      # middle of a word is part of the value, not a YAML comment.
+      NTLMRAIN_SERVER_DATA_BASE: "/data/netntlmv1_byte#7-7_0_881689x134217668"
 
-      # Required: GIDX index file path (inside container)
-      NTLMRAIN_SERVER_INDEX: /data/ntlmv1.gidx
+      # Required: GIDX index file path (inside container). Unlike the base path
+      # above, this is a real file: the shard prefix plus ".gidx".
+      NTLMRAIN_SERVER_INDEX: "/data/netntlmv1_byte#7-7_0_881689x134217668.gidx"
 
       # Required: directory for SQLite queue DB and jobs blob tree
       # Must be writable; should be on a separate volume from table data
@@ -65,9 +74,14 @@ services:
       # NTLMRAIN_SERVER_AUTH_PASSWORD_FILE: "/run/secrets/ntlmrain_password"
 
     volumes:
-      # Read-only bind-mount of table data (GRTB shards + GIDX index)
-      # Replace /path/to/your/table with the actual host path to your table
-      - /path/to/your/table:/data:ro
+      # Read-only bind-mount of table data (GRTB shards + GIDX index).
+      #
+      # The host side is the DIRECTORY CONTAINING the shards, not the table
+      # itself -- there is no single file to point at. Replace /path/to/tables
+      # with that directory. The shards and the .gidx inside it must be
+      # readable by uid 1000, which is the unprivileged user the container
+      # drops to; a root-owned 0600 table mounts cleanly and then fails to open.
+      - /path/to/tables:/data:ro
 
       # Read-write volume/bind-mount for SQLite queue DB and jobs directory
       # This must NOT be read-only and should NOT share the mount with table data
