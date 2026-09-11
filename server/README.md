@@ -39,7 +39,11 @@ cargo run --profile release-server -p ntlmrain-server -- \
 ```
 
 See `--help` for the full flag surface (lookup concurrency, queue depth,
-validation limits, job timeout, and the phase-2 `--static-dir` stub).
+validation limits, job timeout, and `--static-dir` for serving static web assets).
+
+## Static assets
+
+To serve a web UI or other static assets, pass `--static-dir /path/to/web/dist`. Files in that directory are served at `/` alongside the API routes (`/api/v1/*`), health checks, and OpenAPI documentation.
 
 ## Auth
 

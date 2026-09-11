@@ -23,7 +23,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tower::util::ServiceExt;
 use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 
@@ -212,18 +214,36 @@ pub fn build_router(
         .route("/health/ready", get(health_ready))
         .route("/openapi.json", get(openapi_json))
         .route("/docs", get(docs_page))
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
-    let router = Router::new()
+    let mut router = Router::new()
         .merge(submissions_router)
         .merge(public_router)
-        .layer(CatchPanicLayer::custom(handle_panic))
+        .layer(CatchPanicLayer::custom(handle_panic));
+
+    // Add static file serving fallback if configured
+    if let Some(path) = app_state.config.static_dir.clone() {
+        router = router.fallback(move |req: axum::extract::Request| {
+            let path = path.clone();
+            async move {
+                match ServeDir::new(path).oneshot(req).await {
+                    Ok(response) => response.map(Body::new),
+                    Err(_) => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .unwrap(),
+                }
+            }
+        });
+    }
+
+    let router = router
         // Phase 2 stub (plan section 9): the browser UI isn't mounted yet,
         // but every response already carries a minimal same-origin CSP so
         // there's nothing to retrofit once it lands.
         .layer(SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("default-src 'self'"),
+            HeaderValue::from_static("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:"),
         ));
 
     Ok(router)
@@ -1328,5 +1348,151 @@ mod tests {
         assert!(!is_valid_token(&"A".repeat(64))); // uppercase rejected
         assert!(!is_valid_token(&"a".repeat(63))); // too short
         assert!(!is_valid_token(&"g".repeat(64))); // out of hex range
+    }
+
+    #[tokio::test]
+    async fn static_dir_serves_files_at_root_when_configured() {
+        let static_dir = tempfile::tempdir().expect("tempdir for static files");
+        let index_path = static_dir.path().join("index.html");
+        let test_content = b"<!doctype html><html><body>Hello, World!</body></html>";
+        tokio::fs::write(&index_path, test_content)
+            .await
+            .expect("write index.html");
+
+        let harness = harness_with(Duration::from_millis(50), |config| {
+            config.static_dir = Some(static_dir.path().to_path_buf());
+        });
+
+        // Test GET /
+        let root_response = call(&harness.router, "GET", "/", Vec::new(), vec![]).await;
+        assert_eq!(root_response.status(), StatusCode::OK);
+        let root_bytes = to_bytes(root_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(root_bytes.as_ref(), test_content);
+
+        // Test GET /index.html
+        let index_response = call(&harness.router, "GET", "/index.html", Vec::new(), vec![]).await;
+        assert_eq!(index_response.status(), StatusCode::OK);
+        let index_bytes = to_bytes(index_response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(index_bytes.as_ref(), test_content);
+    }
+
+    #[tokio::test]
+    async fn static_dir_none_does_not_affect_existing_routes() {
+        let harness = harness();
+
+        // All existing routes should work exactly as before
+        // Health checks
+        let live = call(&harness.router, "GET", "/health/live", Vec::new(), vec![]).await;
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let ready = call(&harness.router, "GET", "/health/ready", Vec::new(), vec![]).await;
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        // OpenAPI and docs
+        let openapi = call(&harness.router, "GET", "/openapi.json", Vec::new(), vec![]).await;
+        assert_eq!(openapi.status(), StatusCode::OK);
+
+        let docs = call(&harness.router, "GET", "/docs", Vec::new(), vec![]).await;
+        assert_eq!(docs.status(), StatusCode::OK);
+
+        // API routes work as expected (submission test)
+        let endpoint_file = encode_endpoint_file(&[1, 2]);
+        let submit_response = call(
+            &harness.router,
+            "POST",
+            "/api/v1/submissions",
+            endpoint_file,
+            vec![("content-type", "application/vnd.netntlmv1.endpoints")],
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn static_files_do_not_shadow_api_routes() {
+        let static_dir = tempfile::tempdir().expect("tempdir for static files");
+
+        // Create files that could shadow API routes if the fallback is applied incorrectly
+        let api_path = static_dir.path().join("api");
+        tokio::fs::create_dir(&api_path).await.expect("create api dir");
+        let shadowing_file = api_path.join("v1");
+        tokio::fs::create_dir(&shadowing_file)
+            .await
+            .expect("create api/v1 dir");
+
+        let harness = harness_with(Duration::from_millis(50), |config| {
+            config.static_dir = Some(static_dir.path().to_path_buf());
+        });
+
+        // API routes must still work and not be shadowed by the static files
+        let endpoint_file = encode_endpoint_file(&[1, 2]);
+        let submit_response = call(
+            &harness.router,
+            "POST",
+            "/api/v1/submissions",
+            endpoint_file.clone(),
+            vec![("content-type", "application/vnd.netntlmv1.endpoints")],
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::ACCEPTED);
+
+        // Health checks must not be shadowed
+        let live = call(&harness.router, "GET", "/health/live", Vec::new(), vec![]).await;
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let ready = call(&harness.router, "GET", "/health/ready", Vec::new(), vec![]).await;
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        // OpenAPI and docs must not be shadowed
+        let openapi = call(&harness.router, "GET", "/openapi.json", Vec::new(), vec![]).await;
+        assert_eq!(openapi.status(), StatusCode::OK);
+
+        let docs = call(&harness.router, "GET", "/docs", Vec::new(), vec![]).await;
+        assert_eq!(docs.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csp_header_is_present_on_api_responses() {
+        let harness = harness();
+        let response = call(&harness.router, "GET", "/health/live", Vec::new(), vec![]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = headers_of(&response);
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("CSP header must be present")
+            .to_str()
+            .expect("CSP header must be valid UTF-8");
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self' 'wasm-unsafe-eval'"));
+        assert!(csp.contains("worker-src 'self' blob:"));
+    }
+
+    #[tokio::test]
+    async fn csp_header_is_present_on_static_file_responses() {
+        let static_dir = tempfile::tempdir().expect("tempdir for static files");
+        let index_path = static_dir.path().join("index.html");
+        tokio::fs::write(&index_path, b"<html></html>")
+            .await
+            .expect("write index.html");
+
+        let harness = harness_with(Duration::from_millis(50), |config| {
+            config.static_dir = Some(static_dir.path().to_path_buf());
+        });
+
+        let response = call(&harness.router, "GET", "/index.html", Vec::new(), vec![]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = headers_of(&response);
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("CSP header must be present on static files")
+            .to_str()
+            .expect("CSP header must be valid UTF-8");
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self' 'wasm-unsafe-eval'"));
+        assert!(csp.contains("worker-src 'self' blob:"));
     }
 }
