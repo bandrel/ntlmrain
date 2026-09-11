@@ -259,11 +259,28 @@ export function renderArchiveList(
   for (const summary of summaries) {
     const item = document.createElement("li");
     item.dataset.selected = String(summary.run_id === selectedRunId);
+
+    // `archive/db.ts` reads these back with a blind cast and no runtime
+    // shape check, so treat every field here as untrusted, the same as
+    // `renderArchiveDetail`/`renderResults` below — no `innerHTML` template-
+    // string concatenation, ever, even for fields that happen to be
+    // numeric/enum/date-derived today.
     const when = new Date(summary.created_at).toLocaleString();
-    const hashLabel = summary.matched
-      ? `<span class="nr-archive-run-hash">${summary.nt_hash_hex ?? "matched"}</span>`
-      : "no match";
-    item.innerHTML = `<div>${when} · ${summary.input_mode}</div><div>${hashLabel}</div>`;
+    const topLine = document.createElement("div");
+    topLine.textContent = `${when} · ${summary.input_mode}`;
+
+    const bottomLine = document.createElement("div");
+    if (summary.matched) {
+      const hashSpan = document.createElement("span");
+      hashSpan.className = "nr-archive-run-hash";
+      hashSpan.textContent = summary.nt_hash_hex ?? "matched";
+      bottomLine.appendChild(hashSpan);
+    } else {
+      bottomLine.textContent = "no match";
+    }
+
+    item.appendChild(topLine);
+    item.appendChild(bottomLine);
     item.addEventListener("click", () => onSelect(summary.run_id));
     listEl.appendChild(item);
   }
