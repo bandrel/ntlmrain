@@ -23,7 +23,6 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use tower::util::ServiceExt;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -223,24 +222,15 @@ pub fn build_router(
 
     // Add static file serving fallback if configured
     if let Some(path) = app_state.config.static_dir.clone() {
-        router = router.fallback(move |req: axum::extract::Request| {
-            let path = path.clone();
-            async move {
-                match ServeDir::new(path).oneshot(req).await {
-                    Ok(response) => response.map(Body::new),
-                    Err(_) => Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Body::empty())
-                        .unwrap(),
-                }
-            }
-        });
+        router = router.fallback_service(ServeDir::new(path));
     }
 
     let router = router
-        // Phase 2 stub (plan section 9): the browser UI isn't mounted yet,
-        // but every response already carries a minimal same-origin CSP so
-        // there's nothing to retrofit once it lands.
+        // CSP covers both API and static responses: `script-src 'self'
+        // 'wasm-unsafe-eval'` permits WASM module instantiation for the
+        // browser UI, and `worker-src 'self' blob:` permits worker threads
+        // using blob: URLs (needed for crypto operations without blocking
+        // the main thread).
         .layer(SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:"),
@@ -1466,9 +1456,10 @@ mod tests {
             .expect("CSP header must be present")
             .to_str()
             .expect("CSP header must be valid UTF-8");
-        assert!(csp.contains("default-src 'self'"));
-        assert!(csp.contains("script-src 'self' 'wasm-unsafe-eval'"));
-        assert!(csp.contains("worker-src 'self' blob:"));
+        assert_eq!(
+            csp,
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:"
+        );
     }
 
     #[tokio::test]
@@ -1491,8 +1482,9 @@ mod tests {
             .expect("CSP header must be present on static files")
             .to_str()
             .expect("CSP header must be valid UTF-8");
-        assert!(csp.contains("default-src 'self'"));
-        assert!(csp.contains("script-src 'self' 'wasm-unsafe-eval'"));
-        assert!(csp.contains("worker-src 'self' blob:"));
+        assert_eq!(
+            csp,
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:"
+        );
     }
 }
