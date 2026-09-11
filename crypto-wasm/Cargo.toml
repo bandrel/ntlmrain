@@ -1,0 +1,46 @@
+[package]
+name = "crypto-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "WASM bindings around ntlmrain's pure CPU crypto/format code, plus a serial verify-candidates port for the browser"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ntlmrain = { path = ".." }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+# Small, and turns wasm panics (which otherwise surface only as an opaque
+# "unreachable executed" trap in the browser console) into readable
+# `console.error` messages with the Rust panic message and location.
+console_error_panic_hook = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+hex = "0.4"
+
+# `ntlmrain` depends on `rand`, which pulls in `getrandom`. `getrandom` 0.3
+# refuses to build for `wasm32-unknown-unknown` unless its `wasm_js` backend
+# is both (a) enabled here (feature unification requires it as a direct
+# dependency of a crate that will actually target wasm32) and (b) selected
+# at build time via `--cfg getrandom_backend="wasm_js"` (see
+# .cargo/config.toml). Nothing in crypto-wasm itself needs randomness.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# The `wasm-opt` binary vendored by this environment's wasm-pack (binaryen,
+# pinned by wasm-pack's own release) predates rustc 1.9x's default-enabled
+# bulk-memory-operations codegen for wasm32-unknown-unknown, so it rejects
+# `memory.copy`/`memory.fill` instructions in the otherwise-valid module
+# with "Bulk memory operations require bulk memory". This is a toolchain
+# version mismatch, not a bug in this crate's output; skip the optional
+# post-build optimization pass rather than pin an older rustc or a newer
+# wasm-pack. Revisit once the environment's wasm-pack/binaryen is updated.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

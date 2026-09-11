@@ -1,0 +1,28 @@
+[env]
+# `crypto-wasm`'s serial verify port and the root crate's own portable
+# bitslice tests (`bs_des`/`bs_sboxes`, unrolled Feistel rounds with many
+# `u64` locals) need more than the 2MiB default test-thread stack in
+# unoptimized (debug) builds, or `cargo test` aborts with a stack
+# overflow. The native parallel path avoids this by always running the
+# bitslice engine inside `bitslice::with_bitslice_stack`'s 32MiB scoped
+# thread; `crypto-wasm` deliberately does not spawn any OS thread (wasm32
+# has none), so the test *runner* needs the larger stack instead. 64MiB
+# matches that budget with headroom.
+RUST_MIN_STACK = "67108864"
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  # `getrandom` 0.3 (pulled in transitively via `ntlmrain`'s `rand`
+  # dependency) requires opting into its wasm-bindgen-backed browser RNG
+  # explicitly for this target; see crypto-wasm/Cargo.toml's `getrandom`
+  # dependency comment for the other half of this.
+  "--cfg", "getrandom_backend=\"wasm_js\"",
+  # Same underlying cause as RUST_MIN_STACK above: unoptimized (debug)
+  # builds of the unrolled bitsliced-DES Feistel rounds have very large
+  # per-call stack frames. wasm32's default ~1MiB stack (there is no OS
+  # thread to give a bigger one to) overflows into the rest of linear
+  # memory under `wasm-pack test`'s debug-profile build, trapping with
+  # "memory access out of bounds". 16MiB matches this crate's actual
+  # working set with headroom.
+  "-C", "link-args=-z stack-size=16777216",
+]
