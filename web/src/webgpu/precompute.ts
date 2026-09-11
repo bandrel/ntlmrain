@@ -385,6 +385,18 @@ export interface PrecomputeOptions {
   workgroupSize: number;
   /** Target time budget per dispatch, in ms. Default 800 (see module docs). */
   budgetMs?: number;
+  /**
+   * Mirrors native's `DispatchMode::FixedSteps(steps)`: when set, every
+   * dispatch targets exactly this many total DES-reduction steps (clamped
+   * to at least 1, matching `gpu.rs`'s `steps.max(1)`) instead of the
+   * EWMA-adaptive budget `AdaptiveStepScheduler` computes from `budgetMs`.
+   * Unlike `AdaptiveMs`, native's dispatch loop never updates `target_steps`
+   * again once in `FixedSteps` mode (see `gpu.rs`'s dispatch loop: the EWMA
+   * update is gated on `if let DispatchMode::AdaptiveMs(_) = ...`), so this
+   * file likewise skips `AdaptiveStepScheduler.recordBatch` entirely when
+   * `fixedTargetSteps` is set — `budgetMs` is ignored in that case.
+   */
+  fixedTargetSteps?: number;
   onProgress?: (progress: PrecomputeProgress) => void;
 }
 
@@ -469,7 +481,9 @@ export async function runPrecompute(
   const { hashLo, hashHi } = targetToHashWords(options.target);
   const reductionOffset = (tableIndex * 65_536) >>> 0;
 
-  const scheduler = new AdaptiveStepScheduler(budgetMs);
+  const fixedTargetSteps =
+    options.fixedTargetSteps !== undefined ? Math.max(Math.trunc(options.fixedTargetSteps), 1) : undefined;
+  const scheduler = new AdaptiveStepScheduler(budgetMs, fixedTargetSteps ?? INITIAL_TARGET_STEPS);
   let stepsDone = 0;
   const stepsTotal = stepsForRange(0, outputLen);
   const bindGroupLayout = pipeline.getBindGroupLayout(0);
@@ -478,7 +492,7 @@ export async function runPrecompute(
     let start = sliceStart;
     while (start < outputLen) {
       const remaining = outputLen - start;
-      const targetSteps = scheduler.currentTargetSteps;
+      const targetSteps = fixedTargetSteps ?? scheduler.currentTargetSteps;
       const length = slicedDispatchWidth(
         start,
         remaining,
@@ -543,7 +557,9 @@ export async function runPrecompute(
 
       validateMarkers(markerData, groups);
 
-      scheduler.recordBatch(batchSteps, elapsedMs);
+      if (fixedTargetSteps === undefined) {
+        scheduler.recordBatch(batchSteps, elapsedMs);
+      }
 
       start += length;
       stepsDone += batchSteps;
@@ -554,7 +570,7 @@ export async function runPrecompute(
         batchSteps,
         batchWorkgroups: groups,
         elapsedMs,
-        targetSteps: scheduler.currentTargetSteps,
+        targetSteps: fixedTargetSteps ?? scheduler.currentTargetSteps,
       });
     }
   }
