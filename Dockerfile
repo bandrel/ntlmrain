@@ -4,7 +4,6 @@
 #   NTLMRAIN_SERVER_DATA_BASE - path to GRTB table shards base
 #   NTLMRAIN_SERVER_INDEX - path to GIDX index file
 #   NTLMRAIN_SERVER_STATE_DIR - directory for SQLite queue DB and jobs
-#   NTLMRAIN_SERVER_LISTEN - optional, defaults to 127.0.0.1:8080 but should be 0.0.0.0:8080 in container
 # Optional auth env vars (both must be set together):
 #   NTLMRAIN_SERVER_AUTH_USER - HTTP Basic auth username
 #   NTLMRAIN_SERVER_AUTH_PASSWORD or NTLMRAIN_SERVER_AUTH_PASSWORD_FILE - password source
@@ -18,15 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-
-# Copy Cargo workspace manifests first for better layer caching
-COPY Cargo.toml Cargo.lock ./
-COPY server/Cargo.toml ./server/
-
-# Build dependencies: create dummy binary to cache dependencies
-# This is a simple approach; more sophisticated caching would use cargo-chef,
-# but given the complexity of a Cargo workspace and single build target,
-# the straightforward COPY approach is acceptable here.
 
 # Copy source and build the server binary with the release-server profile
 COPY . .
@@ -59,6 +49,9 @@ WORKDIR /home/ntlmrain
 
 # Copy only the built binary from builder stage
 COPY --from=builder --chown=ntlmrain:ntlmrain /build/target/release-server/ntlmrain-server /usr/local/bin/
+
+# Set default listen address to bind all interfaces (required for reverse-proxy reach)
+ENV NTLMRAIN_SERVER_LISTEN=0.0.0.0:8080
 
 # Switch to non-root user
 USER ntlmrain

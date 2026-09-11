@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   ntlmrain-server:
     build:
@@ -26,18 +24,14 @@ services:
     environment:
       # Required: GRTB table shards base path (inside container)
       # Point this at where you bind-mount your table data
-      NTLMRAIN_SERVER_DATA_BASE: /data/tables/ntlmv1
+      NTLMRAIN_SERVER_DATA_BASE: /data/ntlmv1
 
       # Required: GIDX index file path (inside container)
-      NTLMRAIN_SERVER_INDEX: /data/tables/ntlmv1.gidx
+      NTLMRAIN_SERVER_INDEX: /data/ntlmv1.gidx
 
       # Required: directory for SQLite queue DB and jobs blob tree
       # Must be writable; should be on a separate volume from table data
       NTLMRAIN_SERVER_STATE_DIR: /state
-
-      # Required: bind all interfaces inside the container (not localhost)
-      # so a reverse proxy on another container/host can reach it
-      NTLMRAIN_SERVER_LISTEN: "0.0.0.0:8080"
 
       # Optional: concurrent table-read workers (default: system CPU count)
       # NTLMRAIN_SERVER_READ_WORKERS: 4
