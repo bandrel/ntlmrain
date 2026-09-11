@@ -1,0 +1,35 @@
+# TLS terminator for the ntlmrain stack.
+#
+# Why this exists: the browser UI needs WebGPU, and browsers expose
+# navigator.gpu only in a secure context. Plain http:// on a LAN address is
+# not one, so without TLS the UI loads and then reports WebGPU unavailable.
+#
+# Both modes are driven from .env via TLS_ARGS (see .env.example):
+#
+#   Self-signed (default)   TLS_ARGS=/certs/tls.crt /certs/tls.key
+#       The cert-init service generates these before Caddy starts. No domain,
+#       no DNS, no inbound connectivity. The browser warns once; clicking
+#       through grants a secure context, which is all WebGPU needs.
+#
+#   Let's Encrypt           TLS_ARGS=you@example.com
+#       An email argument switches Caddy to ACME with that account. Requires
+#       SITE_ADDRESS to be a real domain resolving here, with port 80
+#       reachable for the HTTP-01 challenge. The generated self-signed files
+#       are ignored in this mode.
+{
+	# Nothing drives Caddy at runtime, and the admin API would otherwise
+	# listen on port 2019 inside the container.
+	admin off
+}
+
+{$SITE_ADDRESS::443} {
+	tls {$TLS_ARGS}
+
+	# Endpoint submissions run up to 8 MiB. The default cap is smaller and
+	# would reject them before the request reached the server.
+	request_body {
+		max_size 16MB
+	}
+
+	reverse_proxy ntlmrain-server:8080
+}

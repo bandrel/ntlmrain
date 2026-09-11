@@ -45,3 +45,6 @@ web/node_modules/
 web/dist/
 web/public/shaders/
 crypto-wasm/pkg/
+
+# Local deployment secrets/config; never belongs in an image layer.
+.env

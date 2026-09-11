@@ -94,9 +94,71 @@ services:
       # This must NOT be read-only and should NOT share the mount with table data
       - ntlmrain-state:/state
 
+  # Generates the self-signed certificate the proxy serves by default, then
+  # exits. Skips generation entirely if one already exists, so restarting the
+  # stack does not issue a new identity and re-trigger the browser warning
+  # you already clicked through. Unused in Let's Encrypt mode, where Caddy
+  # manages its own certificate.
+  cert-init:
+    image: alpine:3.20
+    restart: "no"
+    command: ["/bin/sh", "/gen-cert.sh"]
+    environment:
+      # Comma-separated extra names/addresses to put in the certificate.
+      # localhost and 127.0.0.1 are always included. Add the LAN address or
+      # hostname you actually open in the browser, e.g. CERT_HOSTS=10.0.0.5.
+      # Browsers match on subjectAltName, so a name that is not listed here
+      # mismatches even though the connection itself works.
+      CERT_HOSTS: ${CERT_HOSTS:-}
+    volumes:
+      - ./caddy/gen-cert.sh:/gen-cert.sh:ro
+      - certs:/certs
+
+  # TLS terminator for the browser UI. See caddy/Caddyfile for the two modes.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      ntlmrain-server:
+        condition: service_started
+      cert-init:
+        # Must not start before the certificate exists, or Caddy fails to
+        # load its config and restart-loops.
+        condition: service_completed_successfully
+    environment:
+      # ":443" answers on any hostname or address. Set to a real domain to
+      # use Let's Encrypt.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:443}
+      # Paths to the generated self-signed pair, or a single email address to
+      # switch Caddy to ACME.
+      TLS_ARGS: ${TLS_ARGS:-/certs/tls.crt /certs/tls.key}
+    ports:
+      - "443:443"
+      # Needed for the ACME HTTP-01 challenge and the HTTP->HTTPS redirect.
+      # Safe to drop when staying on the self-signed default.
+      - "80:80"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - certs:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
 volumes:
   # State directory volume for queue DB and jobs
   # In production, you may want to use a bind-mount instead (path: /some/host/path)
   # to ensure persistence and easy backup/access
   ntlmrain-state:
+    driver: local
+
+  # The generated self-signed certificate and key, shared from cert-init to
+  # caddy. Delete this volume to force a fresh certificate.
+  certs:
+    driver: local
+
+  # Caddy's own state. Matters in Let's Encrypt mode: losing it forces a
+  # re-issue against weekly rate limits.
+  caddy-data:
+    driver: local
+
+  caddy-config:
     driver: local

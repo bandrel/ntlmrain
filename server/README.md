@@ -151,6 +151,30 @@ The container exposes port 8080 and binds all interfaces
 (`NTLMRAIN_SERVER_LISTEN=0.0.0.0:8080`) to allow a reverse proxy on
 another container or host to reach it.
 
+### TLS
+
+`docker compose up` also starts a Caddy reverse proxy on 443, because the
+browser UI needs it. Browsers expose `navigator.gpu` only in a secure
+context, and plain HTTP on a LAN address is not one, so over HTTP the UI
+loads and then reports WebGPU as unavailable. `http://localhost` *is* a
+secure context, so an SSH tunnel works too if you would rather not run the
+proxy.
+
+The server itself speaks plain HTTP only; it has no TLS listener. All TLS
+terminates at the proxy.
+
+Two modes, both set in `.env` (see `.env.example`):
+
+- **Self-signed (default).** A `cert-init` service generates the certificate
+  before Caddy starts, and does not overwrite an existing one, so restarts
+  keep the same identity. Set `CERT_HOSTS` to the addresses you actually
+  browse to; browsers match on `subjectAltName`, so an address missing from
+  that list will mismatch. The browser warns once, and clicking through is
+  enough for WebGPU.
+- **Let's Encrypt.** Set `SITE_ADDRESS` to a domain resolving to this host
+  and `TLS_ARGS` to your email address. Requires port 80 reachable for the
+  HTTP-01 challenge. The generated self-signed files are ignored.
+
 ### Reverse-proxy setup
 
 In a multi-service Docker deployment, attach this service to a shared
