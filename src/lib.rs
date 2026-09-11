@@ -1,12 +1,9 @@
 pub mod artifacts;
 pub mod bitslice;
-// `pub` (not `pub(crate)`) so `crypto-wasm` can call the portable bitsliced
-// DES engine directly on its wasm32 target (which never matches the
-// x86_64-only `fast-des` SIMD path gated out below).
 #[cfg(not(target_arch = "x86_64"))]
-pub mod bs_des;
+mod bs_des;
 #[cfg(not(target_arch = "x86_64"))]
-pub mod bs_sboxes;
+mod bs_sboxes;
 // These four modules are native-only: `cli` drives the whole CLI (GPU +
 // filesystem + network); `compute` schedules native GPU/CPU precompute
 // dispatch; `gpu` calls `wgpu::Instance::enumerate_adapters`, which only
@@ -14,10 +11,10 @@ pub mod bs_sboxes;
 // `local_lookup`/`remote_lookup` use Unix/Windows-only positioned-file-read
 // syscalls and `reqwest`'s `blocking` client, neither of which build for
 // wasm32. `crypto-wasm` (added for the browser web UI) only needs the pure
-// `cpu`/`bs_des`/`bs_sboxes`/`formats`/`params` modules below, so gate the
-// rest out for wasm32 rather than trying to port them — same idiom as the
-// `bs_des`/`bs_sboxes` arch-gating above, just gating on the new target
-// instead of the old one.
+// `cpu`/`bitslice`/`formats`/`params` modules below (it reaches the
+// bitsliced DES engine through the already-arch-agnostic `bitslice`
+// wrappers, not `bs_des`/`bs_sboxes` directly, so those two stay private),
+// so gate the rest out for wasm32 rather than trying to port them.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cli;
 #[cfg(not(target_arch = "wasm32"))]

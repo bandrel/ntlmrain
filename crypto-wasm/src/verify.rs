@@ -2,15 +2,22 @@
 //! candidate-chain-walk algorithm.
 //!
 //! This does not reimplement any DES: every hash is computed by
-//! `ntlmrain::bs_des::netntlmv1_64` (the already-tested portable 64-lane
-//! bitslice engine also used natively on non-x86_64 targets). What's new
-//! here is purely the *scheduling*: the native code runs this same
-//! algorithm across rayon worker threads, each batching 512 chains at a
-//! time through `fast-des`'s x86_64 SIMD path inside a large-stack scoped
-//! OS thread (`with_bitslice_stack`). None of that is available or needed
-//! in a wasm32 module (no threads, no x86_64 SIMD): this is a single-loop,
-//! single-thread port that wave-batches 64 chains at a time — matching
-//! `bs_des::netntlmv1_64`'s native lane width.
+//! `ntlmrain::bitslice::netntlmv1_bitslice_batch` — the same already-tested
+//! bitslice entry point the native code uses, which transparently picks
+//! `fast-des`'s x86_64 SIMD path on x86_64 or the portable `bs_des`
+//! bitslice engine everywhere else (including wasm32). Calling through
+//! this arch-agnostic wrapper (rather than `bs_des::netntlmv1_64`
+//! directly) is what makes `crypto-wasm` itself buildable on x86_64 at
+//! all: `bs_des`/`bs_sboxes` are private to the root crate and only even
+//! *exist* there when `not(target_arch = "x86_64")`. What's new here is
+//! purely the *scheduling*: the native code runs this same algorithm
+//! across rayon worker threads, each batching up to 512 chains at a time
+//! inside a large-stack scoped OS thread (`with_bitslice_stack`). None of
+//! that is available or needed in a wasm32 module (no threads): this is a
+//! single-loop, single-thread port that wave-batches 64 chains at a
+//! time — matching the portable `bs_des` bitslice engine's native lane
+//! width (the same width the x86_64 SIMD path also groups by
+//! internally), without needing any arch-specific branching here.
 //!
 //! Chain-walk semantics, ported verbatim from `cpu_verify.rs`:
 //! - A candidate `(start, position)` is checked at chain positions
@@ -25,14 +32,15 @@
 //!   comparing `position > target_position` to decide whether the chain is
 //!   exhausted.
 
-use ntlmrain::{cpu::is_exact_des_key_match, params::BYTE7_MASK};
+use ntlmrain::{
+    bitslice::{index_to_fast_des_key, netntlmv1_bitslice_batch},
+    cpu::is_exact_des_key_match,
+    params::BYTE7_MASK,
+};
 use wasm_bindgen::prelude::*;
 
-/// Fixed NetNTLMv1 challenge plaintext used by RainbowCrackalack tables
-/// (post-IP state matches `cpu::netntlmv1_hash`'s hardcoded `x`/`y`).
-const NETNTLMV1_CHALLENGE: u64 = 0x1122_3344_5566_7788;
-
-/// Keys hashed per wave, matching `bs_des::netntlmv1_64`'s native lane width.
+/// Keys hashed per wave, matching the portable bitslice engine's native
+/// lane width (`ntlmrain::bitslice`'s non-x86_64 `imp`).
 const LANES: usize = 64;
 
 /// Progress snapshot, field-for-field matching
@@ -129,6 +137,7 @@ where
     let mut stopped = false;
 
     let mut keys_batch = [0u64; LANES];
+    let mut hash_values = [0u64; LANES];
 
     'outer: while !active.is_empty() {
         let active_len = active.len();
@@ -137,26 +146,25 @@ where
 
         while read < active_len {
             let n = (active_len - read).min(LANES);
-            for (slot, state) in keys_batch.iter_mut().zip(active[read..read + n].iter()) {
-                *slot = state.index & BYTE7_MASK;
-            }
-            for slot in &mut keys_batch[n..] {
-                *slot = 0;
+            for (slot, state) in keys_batch[..n]
+                .iter_mut()
+                .zip(active[read..read + n].iter())
+            {
+                *slot = index_to_fast_des_key(state.index);
             }
 
-            let ciphertexts = ntlmrain::bs_des::netntlmv1_64(NETNTLMV1_CHALLENGE, &keys_batch);
+            // `netntlmv1_bitslice_batch` already returns each ciphertext
+            // converted to `byte7_hash_value`'s little-endian hash-word
+            // representation (`ciphertext_to_hash_le`, applied internally
+            // by both its x86_64 and portable backends), so `hash_values`
+            // here is directly comparable to `target_hash` / usable in the
+            // reduction formula with no further conversion.
+            netntlmv1_bitslice_batch(&keys_batch[..n], &mut hash_values[..n]);
             steps_done += n as u64;
 
-            for (i, &ciphertext) in ciphertexts.iter().enumerate().take(n) {
+            for (i, &hash_value) in hash_values.iter().enumerate().take(n) {
                 let slot = read + i;
                 let state = active[slot];
-                // `bs_des::netntlmv1_64` returns ciphertexts as big-endian
-                // integers (its own doc comment); `byte7_hash_value` /
-                // `cpu::netntlmv1_hash`'s output both treat the DES block as
-                // big-endian bytes read back little-endian as a u64, so
-                // this conversion is exactly `ciphertext_to_hash_le`.
-                let hash_bytes = ciphertext.to_be_bytes();
-                let hash_value = u64::from_le_bytes(hash_bytes);
 
                 let exact_hit =
                     hash_value == target_hash && is_exact_des_key_match(state.index, &target);
@@ -409,6 +417,28 @@ mod tests {
         hex::decode(hex_str).unwrap().try_into().unwrap()
     }
 
+    /// Every test below that calls `verify_candidates_serial` with a
+    /// non-empty candidate list needs a bigger-than-default stack: the
+    /// unrolled bitsliced-DES Feistel rounds it calls through
+    /// (`ntlmrain::bitslice::netntlmv1_bitslice_batch`, portable `bs_des`
+    /// backend on this non-x86_64 dev machine) have very large per-call
+    /// stack frames in unoptimized (debug) builds, which overflow the
+    /// default 2MiB test-thread stack (confirmed empirically: every test
+    /// here that invokes `verify_candidates_serial` aborted with a stack
+    /// overflow before this wrapper was added; `empty_candidate_list_*`,
+    /// which returns before ever calling the batch function, did not).
+    /// This mirrors `ntlmrain::bitslice::with_bitslice_stack`'s own
+    /// scoped-thread pattern (`src/bitslice.rs:20-33`) rather than
+    /// widening every cargo-launched process's stack workspace-wide.
+    fn with_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn big-stack test thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
     /// Walk `position` reduction steps from `start` and return the final
     /// chain index alongside its ciphertext, using the scalar reference
     /// implementation (independent of both the native parallel verifier
@@ -433,14 +463,16 @@ mod tests {
         // the answer, no reduction) must hit immediately at that exact
         // index.
         let target = hex8(PT1_CIPHERTEXT);
-        let outcome = verify_candidates_serial(&[(PT1_INDEX, 0)], target, 0, true, |_| {});
+        with_big_stack(move || {
+            let outcome = verify_candidates_serial(&[(PT1_INDEX, 0)], target, 0, true, |_| {});
 
-        assert_eq!(outcome.keys, vec![PT1_INDEX]);
-        assert_eq!(outcome.candidates_completed, 1);
-        assert_eq!(outcome.candidates_total, 1);
-        assert_eq!(outcome.steps_completed, 1);
-        assert_eq!(outcome.steps_total, 1);
-        assert!(!outcome.stopped_early);
+            assert_eq!(outcome.keys, vec![PT1_INDEX]);
+            assert_eq!(outcome.candidates_completed, 1);
+            assert_eq!(outcome.candidates_total, 1);
+            assert_eq!(outcome.steps_completed, 1);
+            assert_eq!(outcome.steps_total, 1);
+            assert!(!outcome.stopped_early);
+        });
     }
 
     #[test]
@@ -448,21 +480,25 @@ mod tests {
         let (_, target) = walk(0x4321, 4);
         let mut miss_target = target;
         miss_target[7] ^= 1;
-        let outcome = verify_candidates_serial(&[(0x4321, 4)], miss_target, 0, true, |_| {});
-        assert!(outcome.keys.is_empty());
-        assert_eq!(outcome.candidates_completed, 1);
-        assert_eq!(outcome.steps_completed, 5);
-        assert!(!outcome.stopped_early);
+        with_big_stack(move || {
+            let outcome = verify_candidates_serial(&[(0x4321, 4)], miss_target, 0, true, |_| {});
+            assert!(outcome.keys.is_empty());
+            assert_eq!(outcome.candidates_completed, 1);
+            assert_eq!(outcome.steps_completed, 5);
+            assert!(!outcome.stopped_early);
+        });
     }
 
     #[test]
     fn finds_hit_at_nonzero_chain_position() {
         let (key, target) = walk(0x1234, 19);
-        let outcome =
-            verify_candidates_serial(&[(0x1234, 18), (0x1234, 19)], target, 0, false, |_| {});
-        assert_eq!(outcome.keys, vec![key]);
-        assert_eq!(outcome.candidates_completed, 2);
-        assert_eq!(outcome.steps_completed, 39);
+        with_big_stack(move || {
+            let outcome =
+                verify_candidates_serial(&[(0x1234, 18), (0x1234, 19)], target, 0, false, |_| {});
+            assert_eq!(outcome.keys, vec![key]);
+            assert_eq!(outcome.candidates_completed, 2);
+            assert_eq!(outcome.steps_completed, 39);
+        });
     }
 
     #[test]
@@ -471,12 +507,14 @@ mod tests {
         let target = netntlmv1_hash(&byte7_index_to_plaintext(start));
         let candidates = [(start, 0), (start, 0), (1u64, 100_000)];
 
-        let all = verify_candidates_serial(&candidates[..2], target, 0, false, |_| {});
-        assert_eq!(all.keys, vec![start]);
+        with_big_stack(move || {
+            let all = verify_candidates_serial(&candidates[..2], target, 0, false, |_| {});
+            assert_eq!(all.keys, vec![start]);
 
-        let first = verify_candidates_serial(&candidates, target, 0, true, |_| {});
-        assert_eq!(first.keys, vec![start]);
-        assert!(first.steps_completed < first.steps_total);
+            let first = verify_candidates_serial(&candidates, target, 0, true, |_| {});
+            assert_eq!(first.keys, vec![start]);
+            assert!(first.steps_completed < first.steps_total);
+        });
     }
 
     #[test]
@@ -508,8 +546,13 @@ mod tests {
             .map(|&(start, position)| CpuCandidate { start, position })
             .collect();
 
+        // The native call already runs on its own big-stack scoped thread
+        // internally (`with_bitslice_stack`); only the serial port's call
+        // needs `with_big_stack` here.
         let native = verify_candidates_with_progress(&native_candidates, target, 0, true, |_| {});
-        let serial = verify_candidates_serial(&serial_candidates, target, 0, false, |_| {});
+        let serial = with_big_stack(move || {
+            verify_candidates_serial(&serial_candidates, target, 0, false, |_| {})
+        });
 
         assert_eq!(serial.keys, native.keys);
         assert_eq!(serial.candidates_completed, native.candidates_completed);
