@@ -2,3 +2,8 @@
 /artifacts/
 ntlmrain.toml
 /crypto-wasm/pkg/
+/web/node_modules/
+/web/dist/
+# Copied from ../shaders/ by web/scripts/copy-shaders.mjs (predev/prebuild);
+# ../shaders/ is the source of truth, this is a build artifact.
+/web/public/shaders/

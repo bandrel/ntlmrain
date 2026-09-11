@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ntlmrain WebGPU precompute (debug harness)</title>
+  </head>
+  <body>
+    <h1>ntlmrain WebGPU precompute debug harness</h1>
+    <p>
+      No UI yet (Task 6 builds the real UI). This page exists to exercise the
+      WebGPU device/precompute pipeline manually in a real browser: open the
+      devtools console and call <code>window.ntlmrainDebugPrecompute(hashHex)</code>
+      with an 8-byte NetNTLMv1 hash as a 16-character hex string.
+    </p>
+    <pre id="log"></pre>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
