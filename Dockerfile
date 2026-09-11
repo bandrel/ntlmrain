@@ -9,7 +9,10 @@
 #   NTLMRAIN_SERVER_AUTH_PASSWORD or NTLMRAIN_SERVER_AUTH_PASSWORD_FILE - password source
 
 # ===== Builder Stage =====
-FROM rust:1.88-bookworm AS builder
+# Pinned above the workspace's own edition-2024 floor (rustc >=1.85): a
+# transitive dependency (wide/safe_arch, pulled in via bytemuck) currently
+# requires rustc >=1.89, so this pin tracks that higher floor instead.
+FROM rust:1.90-bookworm AS builder
 
 # Install C compiler required by rusqlite's bundled SQLite feature
 RUN apt-get update && apt-get install -y --no-install-recommends \
