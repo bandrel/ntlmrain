@@ -81,6 +81,8 @@ cargo build --release
 The resulting executable is `target/release/ntlmrain` (`ntlmrain.exe` on
 Windows). Shader sources and the DES LUT are embedded in the executable.
 
+A browser-based WebGPU web UI is also available, served by `ntlmrain-server`'s `--static-dir` flag; see `web/README.md` for the build steps.
+
 ## Performance
 
 The following empirical measurements cover a complete NetNTLMv1 response: two precompute passes, two table lookups and verification of both candidate sets. The listed totals are the observed complete runtimes, including lookup.

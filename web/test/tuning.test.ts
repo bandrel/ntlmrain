@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateTuningSamples,
   alternatingTuningOrder,
+  autoTuneDevice,
   calibratedSyntheticSteps,
   coefficientOfVariation,
   confirmedSlowTuningRates,
@@ -171,6 +172,50 @@ describe("validWorkgroups", () => {
     expect(
       validWorkgroups({ maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 1_024 }),
     ).toEqual([32, 64, 128, 256]);
+  });
+});
+
+describe("autoTuneDevice's forcedWorkgroup validation", () => {
+  // Regression test for the final whole-branch review's finding: picking
+  // 512/1024 in the UI's manual override used to bypass `validWorkgroups`
+  // entirely (`forcedWorkgroup` was taken verbatim), so an unsupported
+  // workgroup size only surfaced as an opaque WebGPU validation error deep
+  // inside pipeline/dispatch creation. This must now be validated up front,
+  // before any GPU call, with a clear and specific error message.
+
+  it("rejects a forcedWorkgroup the device's negotiated limits don't support", async () => {
+    await expect(
+      autoTuneDevice({
+        device: {} as GPUDevice,
+        lutBuffer: {} as GPUBuffer,
+        limits: { maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 256 },
+        supportedShaders: ["compact"],
+        forcedWorkgroup: 512,
+      }),
+    ).rejects.toThrow(/workgroup size 512 is not supported by this device/i);
+  });
+
+  it("rejects a forcedWorkgroup of 1024 the same way", async () => {
+    await expect(
+      autoTuneDevice({
+        device: {} as GPUDevice,
+        lutBuffer: {} as GPUBuffer,
+        limits: { maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 256 },
+        supportedShaders: ["compact"],
+        forcedWorkgroup: 1_024,
+      }),
+    ).rejects.toThrow(/workgroup size 1024 is not supported by this device/i);
+  });
+
+  it("still rejects with 'no supported workgroup size' when the device supports none at all, even with no forcedWorkgroup", async () => {
+    await expect(
+      autoTuneDevice({
+        device: {} as GPUDevice,
+        lutBuffer: {} as GPUBuffer,
+        limits: { maxComputeInvocationsPerWorkgroup: 0, maxComputeWorkgroupSizeX: 0 },
+        supportedShaders: ["compact"],
+      }),
+    ).rejects.toThrow(/no supported workgroup size/i);
   });
 });
 

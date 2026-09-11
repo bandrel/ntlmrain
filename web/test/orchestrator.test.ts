@@ -91,11 +91,11 @@ describe("runOrchestrator sequencing", () => {
       "encodeEndpointFile",
       "lookup",
       "decodeCandidateFile",
-      "verifyCandidates",
       "precompute:2",
       "encodeEndpointFile",
       "lookup",
       "decodeCandidateFile",
+      "verifyCandidates",
       "verifyCandidates",
       "recoverPt3",
       "assembleNtHash",
@@ -106,7 +106,7 @@ describe("runOrchestrator sequencing", () => {
     expect(result.ntHashes).toHaveLength(1);
   });
 
-  it("does not start des2's precompute until des1's lookup+verify promise has resolved", async () => {
+  it("does not start des2's precompute until des1's lookup promise has resolved", async () => {
     let des1LookupResolved = false;
     let des2PrecomputeStartedBeforeDes1LookupResolved = false;
     let precomputeCount = 0;
@@ -130,6 +130,45 @@ describe("runOrchestrator sequencing", () => {
 
     await runOrchestrator(RESPONSE, ports);
     expect(des2PrecomputeStartedBeforeDes1LookupResolved).toBe(false);
+  });
+
+  it("does not verify either slot until BOTH des1's and des2's lookups have completed", async () => {
+    // Regression test for the final whole-branch review's finding: verify
+    // used to run inside the per-target loop (precompute->lookup->verify for
+    // des1, only then starting des2's precompute), blocking des2's entire
+    // pipeline behind des1's verify for no reason. It must now run in a
+    // separate pass after both lookups (not just des1's) have resolved.
+    let lookupsCompleted = 0;
+    let verifyStartedBeforeBothLookupsCompleted = false;
+
+    const { ports, calls } = fakePorts({
+      lookup: async (_endpointFile, _expectedCount, onEvent) => {
+        // Simulate network latency with a real timer delay so a buggy
+        // implementation that verifies des1 before des2's lookup starts (or
+        // completes) would have a chance to race ahead.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        lookupsCompleted += 1;
+        calls.push("lookup");
+        onEvent?.({ type: "submitted", submissionToken: "token", pollWithinSeconds: 1 });
+        return new Uint8Array([9, 9]);
+      },
+      verifyCandidates: (_candidates, _target, _stopAtFirst) => {
+        calls.push("verifyCandidates");
+        if (lookupsCompleted < 2) {
+          verifyStartedBeforeBothLookupsCompleted = true;
+        }
+        return { keys: [123n] };
+      },
+    });
+
+    await runOrchestrator(RESPONSE, ports);
+    expect(verifyStartedBeforeBothLookupsCompleted).toBe(false);
+    expect(lookupsCompleted).toBe(2);
+    // Both "lookup" calls (and their "decodeCandidateFile" companions) must
+    // appear before either "verifyCandidates" call in the recorded order.
+    const firstVerifyIndex = calls.indexOf("verifyCandidates");
+    const secondLookupIndex = calls.lastIndexOf("lookup");
+    expect(secondLookupIndex).toBeLessThan(firstVerifyIndex);
   });
 
   it("runs only des1 for a bare 8-byte Des target (no des2, no NT hash)", async () => {

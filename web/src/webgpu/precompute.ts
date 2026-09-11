@@ -308,6 +308,12 @@ export function validateMarkers(markerWords: Uint32Array, groups: number): void 
 import precomputeCompactSource from "../../../shaders/precompute_compact.wgsl?raw";
 import precomputeExpandedSource from "../../../shaders/precompute_expanded.wgsl?raw";
 
+// Re-exported so callers that need the real shipped WGSL text (e.g. the
+// tuning cache key in `webgpu/tuning-cache.ts`, wired up from `main.ts`) can
+// use the exact same bundled strings this module compiles pipelines from,
+// instead of re-fetching or duplicating them.
+export { precomputeCompactSource, precomputeExpandedSource };
+
 function shaderSource(variant: ShaderVariant): string {
   return variant === "compact" ? precomputeCompactSource : precomputeExpandedSource;
 }
@@ -337,11 +343,22 @@ export function createPrecomputePipeline(
   });
 }
 
+export interface LoadedDesLut {
+  buffer: GPUBuffer;
+  /**
+   * The raw bytes fetched, kept alongside the uploaded buffer so callers
+   * that need the actual asset content (e.g. the tuning cache key in
+   * `webgpu/tuning-cache.ts`) don't have to re-fetch or read the buffer
+   * back from the GPU.
+   */
+  bytes: Uint8Array;
+}
+
 /** Fetch `des_lut.bin` once and upload it to a STORAGE `GPUBuffer`, unchanged. */
 export async function loadDesLut(
   device: GPUDevice,
   url = "/shaders/des_lut.bin",
-): Promise<GPUBuffer> {
+): Promise<LoadedDesLut> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`failed to fetch DES LUT from ${url}: ${response.status} ${response.statusText}`);
@@ -358,7 +375,7 @@ export async function loadDesLut(
   });
   new Uint8Array(buffer.getMappedRange()).set(bytes);
   buffer.unmap();
-  return buffer;
+  return { buffer, bytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +495,23 @@ export async function runPrecompute(
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
 
+  // The five buffers allocated above are ~14MB/run (dominated by `output`/
+  // `staging`, each `outputBytes` ~= 7MB) and are only ever used within this
+  // function — wrap the rest of the body in try/finally so a caller that
+  // runs this repeatedly in one browser session (e.g. `main.ts`'s des1/des2
+  // loop, or re-running "Start") doesn't leak them until GC eventually gets
+  // around to it.
+  try {
+    return await runPrecomputeBody();
+  } finally {
+    output.destroy();
+    staging.destroy();
+    uniform.destroy();
+    markers.destroy();
+    markerReadback.destroy();
+  }
+
+  async function runPrecomputeBody(): Promise<BigUint64Array> {
   const { hashLo, hashHi } = targetToHashWords(options.target);
   const reductionOffset = (tableIndex * 65_536) >>> 0;
 
@@ -596,4 +630,5 @@ export async function runPrecompute(
   }
 
   return endpoints;
+  }
 }

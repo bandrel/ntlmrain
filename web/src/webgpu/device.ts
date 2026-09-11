@@ -48,6 +48,13 @@ export async function requestGpuDevice(
       maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
       maxBufferSize: limits.maxBufferSize,
       maxComputeWorkgroupStorageSize: limits.maxComputeWorkgroupStorageSize,
+      // Both default to 256 in plain WebGPU, which silently makes the
+      // 512/1024 members of the native workgroup-size set (see
+      // `webgpu/tuning.ts::validWorkgroups`) unreachable — request the
+      // adapter's real ceiling for both, same "never ask for more than the
+      // adapter offers" pattern as the three limits above.
+      maxComputeInvocationsPerWorkgroup: limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupSizeX: limits.maxComputeWorkgroupSizeX,
     },
   });
 

@@ -614,10 +614,22 @@ export async function autoTuneDevice(options: AutoTuneOptions): Promise<TuningSe
   const deadline = new TuningDeadline(TUNING_BUDGET_MS, options.now);
   const variants = options.forcedVariant ? [options.forcedVariant] : [...options.supportedShaders];
   const supportedWorkgroups = validWorkgroups(limits);
-  const candidateWorkgroups = options.forcedWorkgroup !== undefined ? [options.forcedWorkgroup] : supportedWorkgroups;
   if (supportedWorkgroups.length === 0) {
     throw new Error("no supported workgroup size for this device");
   }
+  // A manual override must be validated against what the negotiated device
+  // actually supports (`limits.maxComputeInvocationsPerWorkgroup` /
+  // `maxComputeWorkgroupSizeX`) — otherwise picking 512/1024 on a device
+  // that never had those limits raised (see `device.ts`) creates a pipeline
+  // with an unsupported workgroup size and WebGPU throws an opaque
+  // validation error deep inside dispatch, instead of this clear message.
+  if (options.forcedWorkgroup !== undefined && !supportedWorkgroups.includes(options.forcedWorkgroup)) {
+    throw new Error(
+      `workgroup size ${options.forcedWorkgroup} is not supported by this device ` +
+        `(supported sizes: ${supportedWorkgroups.join(", ")})`,
+    );
+  }
+  const candidateWorkgroups = options.forcedWorkgroup !== undefined ? [options.forcedWorkgroup] : supportedWorkgroups;
   const baselineWorkgroup = supportedWorkgroups.includes(64) ? 64 : supportedWorkgroups[0];
   const baselineKey: TuningKey = { shader: "compact", workgroupSize: baselineWorkgroup };
   const automaticRequest = options.forcedVariant === undefined && options.forcedWorkgroup === undefined;

@@ -4,10 +4,16 @@
 // `index.html`.
 
 import { requestGpuDevice, supportsExpandedShader } from "./webgpu/device";
-import { createPrecomputePipeline, loadDesLut, runPrecompute } from "./webgpu/precompute";
+import {
+  createPrecomputePipeline,
+  loadDesLut,
+  precomputeCompactSource,
+  precomputeExpandedSource,
+  runPrecompute,
+} from "./webgpu/precompute";
 import { initCrypto } from "./crypto";
 import { createDefaultPorts, runOrchestrator, type OrchestratorPorts } from "./pipeline/orchestrator";
-import { autoTuneDevice, type TuningSelection } from "./webgpu/tuning";
+import { autoTuneDevice, validWorkgroups, type TuningSelection } from "./webgpu/tuning";
 import {
   adaptiveBudgetMs,
   applyManualTuningOverride,
@@ -47,6 +53,7 @@ const dispatchAdaptiveRadio = byId<HTMLInputElement>("nr-dispatch-adaptive");
 const dispatchFixedRadio = byId<HTMLInputElement>("nr-dispatch-fixed");
 const adaptiveTargetInput = byId<HTMLInputElement>("nr-adaptive-target");
 const fixedStepsSelect = byId<HTMLSelectElement>("nr-fixed-steps");
+const forceRetuneCheckbox = byId<HTMLInputElement>("nr-force-retune");
 const continueAutomaticallyCheckbox = byId<HTMLInputElement>("nr-continue-automatically");
 const startButton = byId<HTMLButtonElement>("nr-start");
 const resumeButton = byId<HTMLButtonElement>("nr-resume");
@@ -67,6 +74,9 @@ let activeController: RunController | null = null;
 let currentDevice: GPUDevice | null = null;
 let currentAdapter: GPUAdapter | null = null;
 let currentLutBuffer: GPUBuffer | null = null;
+let currentLutBytes: Uint8Array | null = null;
+/** The `powerPreference` the currently-held device/LUT buffer were negotiated for. */
+let currentPowerPreference: GPUPowerPreference | null = null;
 
 /**
  * `GPUSupportedLimits` is a branded/read-only host object, not a plain
@@ -96,6 +106,7 @@ function currentGpuSettings(): GpuSettingsState {
     adaptiveTargetSeconds: Number(adaptiveTargetInput.value) || defaultGpuSettings().adaptiveTargetSeconds,
     fixedSteps: Number(fixedStepsSelect.value) || defaultGpuSettings().fixedSteps,
     powerPreference: powerPreferenceSelect.value as GPUPowerPreference,
+    forceRetune: forceRetuneCheckbox.checked,
   };
 }
 
@@ -200,6 +211,7 @@ function buildPorts(
   device: GPUDevice,
   adapter: GPUAdapter,
   lutBuffer: GPUBuffer,
+  lutBytes: Uint8Array,
   settings: GpuSettingsState,
 ): PortsBuildResult {
   const precomputeDeviceLimits = {
@@ -222,24 +234,29 @@ function buildPorts(
     precomputeDeviceLimits,
     tuningDeviceLimits,
     supportedShaders,
-    // The tuning cache key normally digests the actual shipped WGSL/LUT
-    // bytes (see `webgpu/tuning-cache.ts`); this UI does not have those
-    // strings/bytes in hand separately from the `?raw` imports Task 3's
-    // `precompute.ts` already bundles privately, so an empty-but-stable key
-    // component is used here instead. This means the cache key is slightly
-    // weaker (won't detect a changed WGSL/LUT on its own), which is an
-    // acceptable trade for this task's scope: it still varies correctly by
-    // adapter/device limits, which is the common case that matters.
+    // The tuning cache key digests the actual shipped WGSL sources and LUT
+    // bytes, so a changed shader or LUT invalidates a previously-cached
+    // tuning selection (see `webgpu/tuning-cache.ts::computeTuningCacheKey`).
+    // `precomputeCompactSource`/`precomputeExpandedSource` and `desLutBytes`
+    // are the real assets `webgpu/precompute.ts` bundles/fetches — re-used
+    // here rather than re-fetched or duplicated.
     tuningCacheKeyInputs: {
       adapterInfo: adapter.info,
       device,
-      precomputeCompactSource: "",
-      precomputeExpandedSource: "",
+      precomputeCompactSource,
+      precomputeExpandedSource,
+      // There is no GPU-based false-alarm/verify shader pipeline in this
+      // codebase (browser-side verification runs through crypto-wasm's
+      // serial WASM port instead — see `pipeline/orchestrator.ts`), so there
+      // is no real source text to digest for these two fields. Left as
+      // empty strings deliberately, not fabricated placeholder content;
+      // building that GPU verify pipeline is out of scope for this fix wave.
       falseAlarmCompactSource: "",
       falseAlarmExpandedSource: "",
-      desLutBytes: new Uint8Array(0),
+      desLutBytes: lutBytes,
     },
     lookupConfig: { baseUrl: window.location.origin },
+    forceRetune: settings.forceRetune,
   });
 
   const tuningRef: { current: TuningSelection | null } = { current: null };
@@ -268,13 +285,56 @@ function buildPorts(
   return { ports, tuningRef };
 }
 
+/**
+ * Negotiate (or reuse) the WebGPU adapter/device and the DES LUT buffer.
+ *
+ * Only re-requests the adapter/device and re-uploads the LUT when the
+ * relevant setting (`powerPreference`) actually changed from what's
+ * currently held, or when nothing has been negotiated yet. Otherwise this
+ * is a no-op that reuses the existing device/buffer across multiple runs in
+ * one browser session. When a replacement genuinely is needed, the
+ * previous device/buffer are destroyed first rather than left to leak until
+ * GC (each is a real live GPU resource — the LUT buffer alone is ~100KB,
+ * but every additional un-destroyed `GPUDevice` also keeps its full
+ * pipeline/buffer graph alive).
+ */
 async function ensureGpu(powerPreference: GPUPowerPreference): Promise<void> {
+  if (
+    currentDevice &&
+    currentAdapter &&
+    currentLutBuffer &&
+    currentLutBytes &&
+    currentPowerPreference === powerPreference
+  ) {
+    return;
+  }
+
   const { adapter, device } = await requestGpuDevice({ powerPreference });
+  const previousLutBuffer = currentLutBuffer;
+  const previousDevice = currentDevice;
+
   currentAdapter = adapter;
   currentDevice = device;
-  currentLutBuffer = await loadDesLut(device);
+  currentPowerPreference = powerPreference;
+  const lut = await loadDesLut(device);
+  currentLutBuffer = lut.buffer;
+  currentLutBytes = lut.bytes;
   shaderExpandedOption.disabled = !supportsExpandedShader(device);
   await initCrypto();
+
+  // Destroy the previous generation's resources only after the new ones are
+  // fully in place, so a mid-negotiation failure above leaves the old,
+  // still-working device/buffer intact instead of tearing them down early.
+  previousLutBuffer?.destroy();
+  if (previousDevice && previousDevice !== device) {
+    previousDevice.destroy();
+  }
+}
+
+function reportGpuSettingsError(message: string): void {
+  startButton.disabled = false;
+  inputFeedbackEl.textContent = message;
+  inputFeedbackEl.setAttribute("data-state", "error");
 }
 
 async function startRun(): Promise<void> {
@@ -285,20 +345,45 @@ async function startRun(): Promise<void> {
     refreshValidation();
     return;
   }
-  const settings = currentGpuSettings();
 
   startButton.disabled = true;
+
+  // Negotiate the device BEFORE reading the GPU settings panel's values:
+  // whether Expanded/512/1024 are actually selectable depends on this
+  // device's negotiated limits (`supportsExpandedShader`, `validWorkgroups`),
+  // which don't exist until `ensureGpu` has run. Reading settings first (the
+  // previous order) meant a first-run manual override could name a shader/
+  // workgroup the device turns out not to support, surfacing as an opaque
+  // WebGPU validation error deep in pipeline creation instead of a clear
+  // message here.
   try {
-    await ensureGpu(settings.powerPreference);
+    await ensureGpu(powerPreferenceSelect.value as GPUPowerPreference);
   } catch (error) {
-    startButton.disabled = false;
-    inputFeedbackEl.textContent = error instanceof Error ? error.message : String(error);
-    inputFeedbackEl.setAttribute("data-state", "error");
+    reportGpuSettingsError(error instanceof Error ? error.message : String(error));
     return;
   }
-  if (!currentDevice || !currentAdapter || !currentLutBuffer) return;
+  if (!currentDevice || !currentAdapter || !currentLutBuffer || !currentLutBytes) return;
 
-  const { ports, tuningRef } = buildPorts(currentDevice, currentAdapter, currentLutBuffer, settings);
+  const settings = currentGpuSettings();
+  if (settings.shader === "expanded" && !supportsExpandedShader(currentDevice)) {
+    reportGpuSettingsError("Expanded shader is not supported by this device's negotiated limits.");
+    return;
+  }
+  if (settings.workgroupSize !== "auto") {
+    const supportedWorkgroups = validWorkgroups({
+      maxComputeInvocationsPerWorkgroup: currentDevice.limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupSizeX: currentDevice.limits.maxComputeWorkgroupSizeX,
+    });
+    if (!supportedWorkgroups.includes(settings.workgroupSize)) {
+      reportGpuSettingsError(
+        `Workgroup size ${settings.workgroupSize} is not supported by this device ` +
+          `(supported sizes: ${supportedWorkgroups.join(", ")}).`,
+      );
+      return;
+    }
+  }
+
+  const { ports, tuningRef } = buildPorts(currentDevice, currentAdapter, currentLutBuffer, currentLutBytes, settings);
   const controller = new RunController(mode);
   activeController = controller;
   progressView.reset();

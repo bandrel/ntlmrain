@@ -43,7 +43,7 @@ validation limits, job timeout, and `--static-dir` for serving static web assets
 
 ## Static assets
 
-To serve a web UI or other static assets, pass `--static-dir /path/to/web/dist`. Files in that directory are served at `/` alongside the API routes (`/api/v1/*`), health checks, and OpenAPI documentation.
+To serve a web UI or other static assets, pass `--static-dir /path/to/web/dist`. Files in that directory are served at `/` alongside the API routes (`/api/v1/*`), health checks, and OpenAPI documentation. See `web/README.md` for how to build the bundled browser WebGPU UI into a `web/dist` directory suitable for this flag.
 
 ## Auth
 

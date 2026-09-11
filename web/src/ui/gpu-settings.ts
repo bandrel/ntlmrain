@@ -30,6 +30,13 @@ export interface GpuSettingsState {
   adaptiveTargetSeconds: number;
   fixedSteps: number;
   powerPreference: GPUPowerPreference;
+  /**
+   * "Re-tune" override: force a fresh `autoTuneDevice` run (supplying the
+   * currently cached selection as the hysteresis `incumbent`) instead of
+   * taking the default cache-hit fast path. See
+   * `pipeline/orchestrator.ts`'s `DefaultPortsOptions.forceRetune`.
+   */
+  forceRetune: boolean;
 }
 
 export function defaultGpuSettings(): GpuSettingsState {
@@ -40,6 +47,7 @@ export function defaultGpuSettings(): GpuSettingsState {
     adaptiveTargetSeconds: DEFAULT_ADAPTIVE_TARGET_SECONDS,
     fixedSteps: FIXED_STEP_OPTIONS[0].value,
     powerPreference: "high-performance",
+    forceRetune: false,
   };
 }
 

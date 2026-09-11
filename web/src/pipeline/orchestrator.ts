@@ -145,7 +145,11 @@ export interface OrchestratorPorts {
  *   2-3. Precompute + submit/poll/download + decode des1.
  *   4. Only after step 3 fully resolves, repeat 2-3 for des2 if present
  *      (strictly sequential, not parallel — a deliberate parity choice).
- *   5. Verify both candidate sets against their respective 8-byte targets.
+ *   5. Only after BOTH des1's and des2's lookups have fully completed,
+ *      verify each slot's candidate set against its own 8-byte target (in a
+ *      separate pass, not interleaved into the loop above) — this ensures
+ *      des2's precompute+lookup is never blocked behind des1's verify, which
+ *      is otherwise independent work with its own network round-trip.
  *   6. If a des3 ciphertext is present, recover it locally (once, since it
  *      does not depend on which des1/des2 keys were found).
  *   7. Assemble NT hash(es) over the des1 x des2 cross product, stopping
@@ -166,7 +170,10 @@ export async function runOrchestrator(
   const tuning = await ports.getTuning();
   options.onEvent?.({ type: "tuning", selection: tuning });
 
-  const desKeys: bigint[][] = [];
+  // Steps 2-4: precompute + submit/poll/download + decode, strictly
+  // sequential target-by-target (des1 fully before des2 starts) — but verify
+  // is deliberately NOT run inside this loop (see step 5 below).
+  const candidatesBySlot: CandidateRecord[][] = [];
   for (let index = 0; index < targets.length; index += 1) {
     const which: DesSlot = index === 0 ? "des1" : "des2";
     const target = targets[index];
@@ -183,10 +190,15 @@ export async function runOrchestrator(
     const candidateFile = await ports.lookup(endpointFile, endpoints.length, (event) =>
       options.onEvent?.({ type: "lookup", which, event }),
     );
-    const candidates = ports.decodeCandidateFile(candidateFile, endpoints.length);
+    candidatesBySlot.push(ports.decodeCandidateFile(candidateFile, endpoints.length));
+  }
 
-    // Step 5: verify this slot's candidates against its own 8-byte target.
-    const outcome = ports.verifyCandidates(candidates, target, !options.findAll, (progress) =>
+  // Step 5: verify each slot's candidates, only after every slot's lookup
+  // (the loop above) has fully completed.
+  const desKeys: bigint[][] = [];
+  for (let index = 0; index < targets.length; index += 1) {
+    const which: DesSlot = index === 0 ? "des1" : "des2";
+    const outcome = ports.verifyCandidates(candidatesBySlot[index], targets[index], !options.findAll, (progress) =>
       options.onEvent?.({ type: "verify-progress", which, progress }),
     );
     desKeys.push(outcome.keys);
@@ -244,6 +256,19 @@ export interface DefaultPortsOptions {
   tuningCacheKeyInputs: TuningCacheKeyInputs;
   lookupConfig: LookupClientConfig;
   incumbentTuning?: TuningKey;
+  /**
+   * When `true`, skip the cache-hit fast path (which otherwise returns a
+   * cached selection directly with no fresh tune at all) and run
+   * `autoTuneDevice` again, supplying the cached selection as `incumbent` so
+   * `stableTuningWinner`'s hysteresis logic (keep the cached incumbent when
+   * it's within noise of a new leader) actually gets exercised. Without this,
+   * no caller ever reaches `autoTuneDevice` with a real incumbent, since the
+   * only path that calls it today is the cache-miss path (where, by
+   * construction, no incumbent can exist) — see the final whole-branch
+   * review's finding on this. Default `false`: the default fast path (cache
+   * hit -> use cached value, no tune) is unchanged.
+   */
+  forceRetune?: boolean;
 }
 
 /**
@@ -266,18 +291,25 @@ export function isCacheableTuningSource(source: string): boolean {
 async function defaultGetTuning(options: DefaultPortsOptions): Promise<TuningSelection> {
   const cacheKey = await computeTuningCacheKey(options.tuningCacheKeyInputs);
   const cached = await getCachedTuning(cacheKey);
-  if (cached) {
+  if (cached && !options.forceRetune) {
     // Matches `src/gpu.rs`'s `cached.source = "cache".into()` /
     // `selection_reason = "cached-winner"` relabeling on a cache hit.
     return { ...cached, source: "cache", selectionReason: "cached-winner" };
   }
+
+  // On a forced re-tune after a cache hit, feed the cached selection back in
+  // as `incumbent` so the hysteresis tie-break in `stableTuningWinner` has a
+  // real incumbent to prefer (rather than always tuning from a blank slate,
+  // which is the only thing that happened here before this fix).
+  const incumbent: TuningKey | undefined =
+    options.incumbentTuning ?? (cached ? { shader: cached.shader, workgroupSize: cached.workgroupSize } : undefined);
 
   const selection = await autoTuneDevice({
     device: options.device,
     lutBuffer: options.lutBuffer,
     limits: options.tuningDeviceLimits,
     supportedShaders: options.supportedShaders,
-    incumbent: options.incumbentTuning,
+    incumbent,
   });
   if (isCacheableTuningSource(selection.source)) {
     await putCachedTuning(cacheKey, selection);
