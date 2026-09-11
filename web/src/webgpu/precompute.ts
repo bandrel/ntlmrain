@@ -391,6 +391,22 @@ export interface PrecomputeOptions {
 export interface PrecomputeDeviceLimits {
   maxComputeWorkgroupsPerDimension: number;
   minStorageBufferOffsetAlignment: number;
+  maxBufferSize: number;
+  maxStorageBufferBindingSize: number;
+}
+
+/** Mirrors `ensure_storage_size` in src/gpu.rs: fail fast with a clear
+ * message instead of letting `device.createBuffer`/`createBindGroup` throw
+ * an opaque validation error deep inside the dispatch loop. */
+function ensureStorageSize(limits: PrecomputeDeviceLimits, bytes: number, label: string): void {
+  if (bytes > limits.maxBufferSize) {
+    throw new Error(`${label} needs ${bytes} bytes; device max buffer size is ${limits.maxBufferSize}`);
+  }
+  if (bytes > limits.maxStorageBufferBindingSize) {
+    throw new Error(
+      `${label} needs ${bytes} bytes; device max storage binding is ${limits.maxStorageBufferBindingSize}`,
+    );
+  }
 }
 
 /**
@@ -412,6 +428,7 @@ export async function runPrecompute(
   const budgetMs = options.budgetMs ?? DEFAULT_BUDGET_MS;
   const outputLen = chainLen - 1;
   const outputBytes = outputLen * 8;
+  ensureStorageSize(deviceLimits, outputBytes, "endpoint output");
 
   const queue = device.queue;
 

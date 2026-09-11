@@ -50,6 +50,8 @@ async function debugPrecompute(targetHex: string): Promise<void> {
     {
       maxComputeWorkgroupsPerDimension: device.limits.maxComputeWorkgroupsPerDimension,
       minStorageBufferOffsetAlignment: device.limits.minStorageBufferOffsetAlignment,
+      maxBufferSize: device.limits.maxBufferSize,
+      maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
     },
     {
       target,
