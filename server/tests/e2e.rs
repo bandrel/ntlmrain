@@ -269,6 +269,7 @@ async fn run_remote_lookup(
             password,
             poll_interval: Duration::from_millis(10),
             request_timeout: Duration::from_secs(30),
+            ..RemoteLookupConfig::default()
         })
         .expect("construct RemoteLookupClient");
         client.lookup(&endpoint_file, None, |_progress| {})

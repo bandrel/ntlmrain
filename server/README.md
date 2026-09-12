@@ -182,6 +182,20 @@ Two modes, both set in `.env` (see `.env.example`):
   browse to; browsers match on `subjectAltName`, so an address missing from
   that list will mismatch. The browser warns once, and clicking through is
   enough for WebGPU.
+
+  The `ntlmrain` CLI has no such click-through: it verifies against a
+  built-in root store and ignores the platform trust store, so a self-signed
+  certificate fails with `lookup connection failed: ... UnknownIssuer`. Copy
+  the certificate out of the `certs` volume and point the client at it:
+
+  ```console
+  $ docker compose cp cert-init:/certs/tls.crt ntlmrain-ca.pem
+  $ ntlmrain crack --remote-url https://lookup.example.internal \
+      --remote-ca-cert ntlmrain-ca.pem ...
+  ```
+
+  `--remote-insecure` skips verification instead, which is fine for a
+  throwaway lab server but leaves the connection open to interception.
 - **Let's Encrypt.** Set `SITE_ADDRESS` to a domain resolving to this host
   and `TLS_ARGS` to your email address. Requires port 80 reachable for the
   HTTP-01 challenge. The generated self-signed files are ignored.

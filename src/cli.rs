@@ -99,6 +99,20 @@ struct Cli {
     remote_password: Option<String>,
     #[arg(long, global = true)]
     no_remote_auth: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PEM",
+        help = "Trust this PEM certificate (or bundle) when verifying the lookup server, in addition to the built-in roots"
+    )]
+    remote_ca_cert: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "remote_ca_cert",
+        help = "Skip TLS verification for the lookup server entirely"
+    )]
+    remote_insecure: bool,
     #[arg(long, global = true, default_value = "artifacts", value_name = "DIR")]
     artifacts_dir: PathBuf,
     #[command(subcommand)]
@@ -347,6 +361,14 @@ impl ProgressOutput {
         if self.quiet {
             return;
         }
+        let mut state = self.state.lock().expect("progress lock");
+        end_active_line(&mut state);
+        eprintln!("{}", message.as_ref());
+    }
+
+    /// Unlike `message`, this ignores `--quiet`: a warning that TLS is not
+    /// being verified must never be silently suppressed.
+    fn warn(&self, message: impl AsRef<str>) {
         let mut state = self.state.lock().expect("progress lock");
         end_active_line(&mut state);
         eprintln!("{}", message.as_ref());
@@ -671,6 +693,8 @@ fn run_cli(cli: Cli) -> Result<(), CliError> {
             remote_username: cli.remote_username.clone(),
             remote_password: cli.remote_password.clone(),
             remote_auth: cli.no_remote_auth.then_some(false),
+            remote_ca_certificate: cli.remote_ca_cert.clone(),
+            remote_insecure: cli.remote_insecure.then_some(true),
         },
     )
     .map_err(input_error)?;
@@ -1026,7 +1050,7 @@ fn command_lookup(
 ) -> Result<(), CliError> {
     let files = resolve_stage_files(&args.endpoints, args.role)?;
     let input_suffix = shared_endpoint_suffix(&files)?;
-    let engine = create_lookup_engine(&args.lookup, config)?;
+    let engine = create_lookup_engine(&args.lookup, config, progress)?;
     let run = RunArtifacts::create(artifact_root).map_err(input_error)?;
     progress.stage(PipelineStage::Lookup);
     let mut outputs = BTreeMap::new();
@@ -1143,7 +1167,7 @@ fn command_crack(
     progress.message("selecting compute engine...");
     let context = create_compute(&args.compute, progress)?;
     announce_compute(progress, &context, &args.compute);
-    let engine = create_lookup_engine(&args.lookup, config)?;
+    let engine = create_lookup_engine(&args.lookup, config, progress)?;
     let dispatch = compute_dispatch(&context, &args.compute.gpu)?;
     let mut outputs = BTreeMap::new();
 
@@ -1710,7 +1734,11 @@ fn precompute_request(target: [u8; 8], dispatch: DispatchMode) -> PrecomputeRequ
     request
 }
 
-fn create_lookup_engine(args: &LookupArgs, config: &Config) -> Result<LookupEngine, CliError> {
+fn create_lookup_engine(
+    args: &LookupArgs,
+    config: &Config,
+    progress: &ProgressOutput,
+) -> Result<LookupEngine, CliError> {
     match args.lookup_backend {
         LookupBackendArg::Remote => {
             if args.data_base.is_some() || args.index.is_some() {
@@ -1718,12 +1746,17 @@ fn create_lookup_engine(args: &LookupArgs, config: &Config) -> Result<LookupEngi
                     "--data-base and --index apply only to --lookup local",
                 ));
             }
+            if config.remote.insecure {
+                progress.warn(insecure_tls_warning(&config.remote.url));
+            }
             RemoteLookupClient::new(RemoteLookupConfig {
                 base_url: config.remote.url.clone(),
                 username: config.remote.username.clone(),
                 password: config.remote.password.clone(),
                 poll_interval: Duration::from_secs(2),
                 request_timeout: Duration::from_secs(30 * 60),
+                ca_certificate: config.remote.ca_certificate.clone(),
+                insecure: config.remote.insecure,
             })
             .map(Box::new)
             .map(LookupEngine::Remote)
@@ -1843,6 +1876,13 @@ fn input_error(error: impl std::fmt::Display) -> CliError {
 fn gpu_error(error: impl std::fmt::Display) -> CliError {
     CliError::Gpu(error.to_string())
 }
+
+/// Shown whenever TLS verification is disabled. Naming the URL keeps the
+/// warning useful when the host came from a config file or environment.
+fn insecure_tls_warning(url: &str) -> String {
+    format!("WARNING: TLS verification disabled for {url} -- traffic is subject to interception.")
+}
+
 fn lookup_error(error: impl std::fmt::Display) -> CliError {
     CliError::Lookup(error.to_string())
 }

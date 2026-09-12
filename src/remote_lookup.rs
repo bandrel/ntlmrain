@@ -6,6 +6,7 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -20,6 +21,13 @@ pub struct RemoteLookupConfig {
     pub password: Option<String>,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
+    /// Extra PEM trust anchor for servers whose certificate does not chain to
+    /// a public root (a self-signed or internal-CA lookup service). Certificate
+    /// and hostname verification still apply, just against this root as well.
+    pub ca_certificate: Option<PathBuf>,
+    /// Disable certificate and hostname verification entirely. Callers are
+    /// expected to warn before enabling this.
+    pub insecure: bool,
 }
 
 impl Default for RemoteLookupConfig {
@@ -30,6 +38,8 @@ impl Default for RemoteLookupConfig {
             password: None,
             poll_interval: Duration::from_secs(2),
             request_timeout: Duration::from_secs(30 * 60),
+            ca_certificate: None,
+            insecure: false,
         }
     }
 }
@@ -84,6 +94,8 @@ pub enum RemoteLookupError {
     InvalidResponse(String),
     #[error("lookup connection failed: {0}")]
     Connect(String),
+    #[error("invalid lookup CA certificate: {0}")]
+    InvalidCaCertificate(String),
     #[error("lookup request timed out: {0}")]
     Timeout(String),
     #[error("lookup request failed: {0}")]
@@ -157,7 +169,7 @@ impl RemoteLookupClient {
             base.join(path)
                 .map_err(|error| RemoteLookupError::InvalidUrl(error.to_string()))
         };
-        let client = Client::builder().timeout(config.request_timeout).build()?;
+        let client = build_client(&config)?;
         Ok(Self {
             client,
             config,
@@ -336,6 +348,38 @@ impl RemoteLookupClient {
             .json(&SubmissionAccess { submission_token })
             .send();
     }
+}
+
+/// Build the HTTP client. `reqwest`'s `rustls-tls` feature trusts the bundled
+/// webpki roots only -- the platform trust store is never consulted -- so a
+/// privately issued server certificate has to be supplied here explicitly.
+fn build_client(config: &RemoteLookupConfig) -> Result<Client, RemoteLookupError> {
+    let mut builder = Client::builder().timeout(config.request_timeout);
+    if let Some(path) = &config.ca_certificate {
+        let pem = std::fs::read(path).map_err(|error| {
+            RemoteLookupError::InvalidCaCertificate(format!("{}: {error}", path.display()))
+        })?;
+        // A bundle keeps intermediate-plus-root PEM files working, and reads a
+        // single self-signed certificate just as well.
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|error| {
+            RemoteLookupError::InvalidCaCertificate(format!("{}: {error}", path.display()))
+        })?;
+        if certificates.is_empty() {
+            return Err(RemoteLookupError::InvalidCaCertificate(format!(
+                "{}: no certificates found",
+                path.display()
+            )));
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    if config.insecure {
+        builder = builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
+    builder.build().map_err(RemoteLookupError::from)
 }
 
 fn validate_token(token: &str) -> Result<(), RemoteLookupError> {
