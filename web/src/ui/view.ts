@@ -115,9 +115,16 @@ export class ProgressSlotView {
       renderStage(this.elements.precompute, snapshot, "DES steps");
     }
     if (slot.lookupEvent) {
-      const status = slot.lookupEvent.status;
-      const done = status ? status.processedRecords : 0;
+      // Read the counts off the retained `lookupStatus`, not off the current
+      // event: `submitted` and `downloaded` carry no status, and reading
+      // through them used to blank the bar to "0 / 0 endpoints (0.0%)".
+      const status = slot.lookupStatus;
       const total = status ? status.recordCount : 0;
+      // A completed lookup is 100% by definition -- the bytes are downloaded.
+      // The last `ready` status can still report fewer records than it has,
+      // since the server serves a checkpointed counter once a job leaves the
+      // running state, so trusting it here would strand the bar near the end.
+      const done = slot.lookupComplete ? total : (status?.processedRecords ?? 0);
       const snapshot = this.elements.meters.lookup.update(done, total);
       renderStage(this.elements.lookup, snapshot, "endpoints");
       this.elements.lookup.line.textContent += ` · ${slot.lookupEvent.type}`;
