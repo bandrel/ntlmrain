@@ -13,12 +13,30 @@ import {
 } from "../pipeline/orchestrator";
 import type { PrecomputeProgress } from "../webgpu/precompute";
 import type { VerifyProgress } from "../pipeline/orchestrator";
+import type { StatusResponse } from "../api/lookup-client";
 import { StageGate, wrapPortsWithGate, type GateWaitInfo } from "./stage-gate";
 import type { RecoveryMode } from "../archive/db";
 
 export interface SlotSnapshot {
   precompute: PrecomputeProgress | null;
   lookupEvent: LookupEvent | null;
+  /**
+   * Last `status` seen for this slot's lookup, retained across the events that
+   * carry none. `LookupEvent.status` rides on the `status` variant alone, so a
+   * consumer reading it off `lookupEvent` loses the counts the moment the
+   * terminal `downloaded` event lands — which is what used to empty the
+   * progress bar to "0 / 0 endpoints" right as the lookup finished.
+   */
+  lookupStatus: StatusResponse | null;
+  /**
+   * Whether the result bytes are in hand. Tracked separately rather than
+   * inferred from `lookupStatus`, because the last `ready` status is allowed
+   * to under-report: the server only live-queries `processed_records` while a
+   * job is running, and once it is ready serves the ~2s-stale checkpointed
+   * column instead. Treating "counts agree" as the completion signal would
+   * park a finished lookup just short of 100%.
+   */
+  lookupComplete: boolean;
   verify: VerifyProgress | null;
 }
 
@@ -34,7 +52,7 @@ export interface RunSnapshot {
 }
 
 function emptySlot(): SlotSnapshot {
-  return { precompute: null, lookupEvent: null, verify: null };
+  return { precompute: null, lookupEvent: null, lookupStatus: null, lookupComplete: false, verify: null };
 }
 
 function idleSnapshot(mode: RecoveryMode): RunSnapshot {
@@ -137,9 +155,17 @@ export class RunController {
             case "precompute-progress":
               this.emit({ slots: this.slotPatch(event.which, { precompute: event.progress }) });
               break;
-            case "lookup":
-              this.emit({ slots: this.slotPatch(event.which, { lookupEvent: event.event }) });
+            case "lookup": {
+              // Only carry `lookupStatus`/`lookupComplete` forward on the
+              // events that actually establish them; `slotPatch` spread-merges,
+              // so an omitted key keeps its previous value rather than
+              // clobbering it with the `undefined` the other variants hold.
+              const patch: Partial<SlotSnapshot> = { lookupEvent: event.event };
+              if (event.event.status) patch.lookupStatus = event.event.status;
+              if (event.event.type === "downloaded") patch.lookupComplete = true;
+              this.emit({ slots: this.slotPatch(event.which, patch) });
               break;
+            }
             case "verify-progress":
               this.emit({ slots: this.slotPatch(event.which, { verify: event.progress }) });
               break;

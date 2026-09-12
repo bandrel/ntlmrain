@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { RunController, type RunSnapshot } from "../src/ui/run-controller";
 import type { OrchestratorPorts } from "../src/pipeline/orchestrator";
+import type { StatusResponse } from "../src/api/lookup-client";
 import type { TuningSelection } from "../src/webgpu/tuning";
 
 // Single DES ciphertext: skips des2/des3/NT-hash assembly (this task's
@@ -55,6 +56,41 @@ function noMatchPorts(): OrchestratorPorts {
   return { ...fakePorts(), verifyCandidates: async () => ({ keys: [] }) };
 }
 
+function status(processedRecords: number, state: string): StatusResponse {
+  return {
+    state,
+    recordCount: 1000,
+    processedRecords,
+    progress: processedRecords / 1000,
+    queuePosition: null,
+    matchCount: null,
+    error: null,
+    pollWithinSeconds: 1,
+    downloadWithinSeconds: null,
+  };
+}
+
+/**
+ * The real event sequence a lookup emits: a `submitted` with no counts, poll
+ * `status` updates carrying them, then a terminal `downloaded` that carries
+ * only a byte count. The final `ready` status deliberately reports fewer than
+ * `recordCount` because the server only live-queries `processed_records` while
+ * the job is running; once it is ready, the ~2s-stale checkpointed column is
+ * what gets served.
+ */
+function lookupSequencePorts(): OrchestratorPorts {
+  return {
+    ...fakePorts(),
+    lookup: async (_endpointFile, _expectedCount, onEvent) => {
+      onEvent?.({ type: "submitted", submissionToken: "token", pollWithinSeconds: 1 });
+      onEvent?.({ type: "status", status: status(400, "running") });
+      onEvent?.({ type: "status", status: status(998, "ready") });
+      onEvent?.({ type: "downloaded", bytesDownloaded: 64 });
+      return new Uint8Array(0);
+    },
+  };
+}
+
 describe("RunController", () => {
   it("goes idle -> running -> done, recording des1's progress along the way", async () => {
     const controller = new RunController("single-des");
@@ -76,6 +112,37 @@ describe("RunController", () => {
     expect(finalSnapshot.slots.des1.lookupEvent?.type).toBe("submitted");
     expect(finalSnapshot.slots.des1.verify?.verifiedKeys).toBe(1n);
     expect(finalSnapshot.result?.des1Keys).toEqual([42n]);
+  });
+
+  // Regression: the lookup bar used to empty itself the instant the download
+  // finished, reading "0 / 0 endpoints (0.0%) ... downloaded" with a dead
+  // rate and ETA. `lookupEvent` held only the most recent event and `status`
+  // rides on the `status` variant alone, so the terminal `downloaded` event
+  // threw the counts away and the meter was fed (0, 0).
+  it("retains the last lookup counts through the terminal downloaded event", async () => {
+    const controller = new RunController("single-des");
+    await controller.start(SINGLE_DES, lookupSequencePorts(), true);
+
+    const slot = controller.current.slots.des1;
+    expect(slot.lookupEvent?.type).toBe("downloaded");
+    expect(slot.lookupStatus?.recordCount).toBe(1000);
+    expect(slot.lookupStatus?.processedRecords).toBe(998);
+  });
+
+  // The counts alone are not enough: the last `ready` status is allowed to lag
+  // (998/1000 above), so carrying it forward unchanged would park a finished
+  // lookup at 99.8% forever. Completion is its own fact, not something to be
+  // inferred from the counts agreeing.
+  it("marks the lookup complete once the bytes are downloaded", async () => {
+    const controller = new RunController("single-des");
+    const seen: boolean[] = [];
+    controller.subscribe((snapshot) => seen.push(snapshot.slots.des1.lookupComplete));
+
+    await controller.start(SINGLE_DES, lookupSequencePorts(), true);
+
+    expect(controller.current.slots.des1.lookupComplete).toBe(true);
+    // Not set early: it must follow the download, not the first status.
+    expect(seen.filter((complete) => complete === false).length).toBeGreaterThan(0);
   });
 
   it("reaches the no-match status when verification finds nothing", async () => {
