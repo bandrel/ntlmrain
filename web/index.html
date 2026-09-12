@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ntlmrain — browser NetNTLMv1 recovery</title>
+    <link rel="stylesheet" href="/src/ui/style.css" />
+  </head>
+  <body>
+    <header class="nr-header">
+      <h1>ntlmrain</h1>
+      <p class="nr-tagline">Rainbow-table NetNTLMv1 recovery, run entirely in this tab via WebGPU.</p>
+    </header>
+
+    <main class="nr-layout">
+      <section class="nr-panel" aria-labelledby="nr-form-heading">
+        <h2 id="nr-form-heading">Recover a hash</h2>
+
+        <fieldset class="nr-mode">
+          <legend>Target shape</legend>
+          <label>
+            <input type="radio" name="nr-mode" id="nr-mode-full" value="full" checked />
+            Full NetNTLMv1 response <span class="nr-hint">(48 hex chars, or a USER::DOMAIN:... capture line)</span>
+          </label>
+          <label>
+            <input type="radio" name="nr-mode" id="nr-mode-single-des" value="single-des" />
+            Single DES ciphertext <span class="nr-hint">(16 hex chars — skips des2/des3/NT-hash assembly)</span>
+          </label>
+        </fieldset>
+
+        <label class="nr-field" for="nr-input">
+          Target
+          <textarea
+            id="nr-input"
+            rows="2"
+            spellcheck="false"
+            placeholder="e.g. 727b4e35f947129e a52b9cdedae86934 bb23ef89f50fc595, or a USER::DOMAIN:... capture line"
+          ></textarea>
+        </label>
+        <p id="nr-input-feedback" class="nr-feedback" role="status"></p>
+
+        <details class="nr-gpu-settings">
+          <summary>GPU settings</summary>
+
+          <div class="nr-field-row">
+            <label class="nr-field" for="nr-shader">
+              Shader
+              <select id="nr-shader">
+                <option value="auto" selected>Auto</option>
+                <option value="compact">Compact</option>
+                <option value="expanded" id="nr-shader-expanded">Expanded</option>
+              </select>
+            </label>
+
+            <label class="nr-field" for="nr-workgroup-size">
+              Workgroup size
+              <select id="nr-workgroup-size">
+                <option value="auto" selected>Auto</option>
+                <option value="32">32</option>
+                <option value="64">64</option>
+                <option value="128">128</option>
+                <option value="256">256</option>
+                <option value="512">512</option>
+                <option value="1024">1024</option>
+              </select>
+            </label>
+
+            <label class="nr-field" for="nr-power-preference">
+              Power preference
+              <select id="nr-power-preference">
+                <option value="high-performance" selected>High performance</option>
+                <option value="low-power">Low power</option>
+              </select>
+            </label>
+          </div>
+
+          <fieldset class="nr-dispatch-mode">
+            <legend>Dispatch mode</legend>
+            <label>
+              <input type="radio" name="nr-dispatch-mode" id="nr-dispatch-adaptive" value="adaptive" checked />
+              Adaptive, target
+              <input type="number" id="nr-adaptive-target" min="0.1" step="0.1" value="0.8" />
+              s per dispatch
+            </label>
+            <label>
+              <input type="radio" name="nr-dispatch-mode" id="nr-dispatch-fixed" value="fixed" />
+              Fixed step count
+              <select id="nr-fixed-steps" disabled>
+                <option value="64000000">64M</option>
+                <option value="128000000">128M</option>
+                <option value="256000000">256M</option>
+                <option value="512000000">512M</option>
+                <option value="1000000000">1B</option>
+              </select>
+            </label>
+          </fieldset>
+
+          <label class="nr-checkbox">
+            <input type="checkbox" id="nr-force-retune" />
+            Force re-tune (ignore any cached GPU tuning result for this run)
+          </label>
+        </details>
+
+        <label class="nr-checkbox">
+          <input type="checkbox" id="nr-continue-automatically" checked />
+          Continue automatically through remote lookup and local verification
+        </label>
+
+        <div class="nr-actions">
+          <button type="button" id="nr-start">Start recovery</button>
+          <button type="button" id="nr-resume" hidden>Continue</button>
+        </div>
+      </section>
+
+      <section class="nr-panel" id="nr-progress-panel" hidden aria-labelledby="nr-progress-heading">
+        <h2 id="nr-progress-heading">Progress</h2>
+        <div id="nr-progress-slots"></div>
+      </section>
+
+      <section class="nr-panel" id="nr-results-panel" hidden aria-labelledby="nr-results-heading">
+        <h2 id="nr-results-heading">Result</h2>
+        <div id="nr-results-body"></div>
+      </section>
+
+      <section class="nr-panel" aria-labelledby="nr-archive-heading">
+        <h2 id="nr-archive-heading">Run archive</h2>
+        <div class="nr-archive-layout">
+          <ul id="nr-archive-list" class="nr-archive-list"></ul>
+          <div id="nr-archive-detail" class="nr-archive-detail">
+            <p class="nr-hint">Select a run to see its full detail.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <template id="nr-slot-template">
+      <div class="nr-slot">
+        <h3 class="nr-slot-title"></h3>
+        <div class="nr-stage" data-stage="precompute">
+          <h4>Precompute</h4>
+          <div class="nr-bar"><div class="nr-bar-fill"></div></div>
+          <p class="nr-stage-line"></p>
+        </div>
+        <div class="nr-stage" data-stage="lookup">
+          <h4>Table lookup</h4>
+          <div class="nr-bar"><div class="nr-bar-fill"></div></div>
+          <p class="nr-stage-line"></p>
+        </div>
+        <div class="nr-stage" data-stage="verify">
+          <h4>Verify candidates</h4>
+          <div class="nr-bar"><div class="nr-bar-fill"></div></div>
+          <p class="nr-stage-line"></p>
+        </div>
+      </div>
+    </template>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

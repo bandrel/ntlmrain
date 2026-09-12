@@ -1,0 +1,146 @@
+services:
+  ntlmrain-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # A GRTB table is one open file descriptor per shard (LocalTable::open
+    # opens every shard up front), plus the mmapped GIDX index and the
+    # SQLite connection. Docker's default nofile limit (1024, inherited from
+    # the daemon) is exhausted by any table with a few hundred shards or
+    # more -- raise it well above realistic shard counts.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "8080:8080"
+    # Network configuration for reverse-proxy scenarios:
+    # By default the service publishes port 8080 on the host. In a reverse-proxy
+    # setup (Traefik, Caddy, nginx, etc.), you will likely instead attach this
+    # service to a shared external network and drop the host port publish:
+    #
+    # networks:
+    #   - proxy-network
+    #
+    # networks:
+    #   proxy-network:
+    #     external: true
+    #
+    # Then configure your reverse proxy to reach this service by its container
+    # name or service name on that network (e.g., "ntlmrain-server:8080").
+
+    # Every server setting lives in .env -- copy .env.example to .env and edit
+    # it there. Nothing in this file needs changing for a normal deployment.
+    #
+    # env_file is used rather than "${VAR}" interpolation on purpose. The
+    # server parses its config with clap, which treats an empty string as a
+    # value that was supplied: NTLMRAIN_SERVER_READ_WORKERS="" is a parse
+    # error, and NTLMRAIN_SERVER_AUTH_USER="" reads as "auth is configured"
+    # and then fails for want of a password. Interpolating an unset optional
+    # would hand clap exactly that empty string; a key simply absent from
+    # .env stays absent from the container environment, which is what the
+    # defaults in config.rs expect.
+    #
+    # required: false keeps "docker compose build" and "config" working
+    # before a .env exists. Running without one still fails loudly -- see the
+    # TABLES_DIR guard on the bind-mount below.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # Required: directory for SQLite queue DB and jobs blob tree. Pinned
+      # here rather than in .env because it has to agree with the /state
+      # volume mount below -- the two are a pair, and a .env that disagreed
+      # would write the queue DB into the container's ephemeral layer.
+      # Compose gives "environment" precedence over "env_file", so setting
+      # NTLMRAIN_SERVER_STATE_DIR in .env has no effect.
+      NTLMRAIN_SERVER_STATE_DIR: /state
+
+    volumes:
+      # Read-only bind-mount of table data (GRTB shards + GIDX index).
+      #
+      # The host side is the DIRECTORY CONTAINING the shards, not the table
+      # itself -- there is no single file to point at. Set TABLES_DIR in .env
+      # to that directory. The shards and the .gidx inside it must be
+      # readable by uid 1000, which is the unprivileged user the container
+      # drops to; a root-owned 0600 table mounts cleanly and then fails to open.
+      #
+      # The ":?" makes a missing TABLES_DIR fail at compose-parse time with
+      # this message, instead of silently mounting nothing and surfacing as a
+      # table-open error minutes later.
+      - ${TABLES_DIR:?set TABLES_DIR in .env to the host directory holding your GRTB shards (copy .env.example to .env)}:/data:ro
+
+      # Read-write volume/bind-mount for SQLite queue DB and jobs directory
+      # This must NOT be read-only and should NOT share the mount with table data
+      - ntlmrain-state:/state
+
+  # Generates the self-signed certificate the proxy serves by default, then
+  # exits. Skips generation entirely if one already exists, so restarting the
+  # stack does not issue a new identity and re-trigger the browser warning
+  # you already clicked through. Unused in Let's Encrypt mode, where Caddy
+  # manages its own certificate.
+  cert-init:
+    image: alpine:3.20
+    restart: "no"
+    command: ["/bin/sh", "/gen-cert.sh"]
+    environment:
+      # Comma-separated extra names/addresses to put in the certificate.
+      # localhost and 127.0.0.1 are always included. Add the LAN address or
+      # hostname you actually open in the browser, e.g. CERT_HOSTS=10.0.0.5.
+      # Browsers match on subjectAltName, so a name that is not listed here
+      # mismatches even though the connection itself works.
+      CERT_HOSTS: ${CERT_HOSTS:-}
+    volumes:
+      - ./caddy/gen-cert.sh:/gen-cert.sh:ro
+      - certs:/certs
+
+  # TLS terminator for the browser UI. See caddy/Caddyfile for the two modes.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      ntlmrain-server:
+        condition: service_started
+      cert-init:
+        # Must not start before the certificate exists, or Caddy fails to
+        # load its config and restart-loops.
+        condition: service_completed_successfully
+    environment:
+      # ":443" answers on any hostname or address. Set to a real domain to
+      # use Let's Encrypt.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:443}
+      # Paths to the generated self-signed pair, or a single email address to
+      # switch Caddy to ACME.
+      TLS_ARGS: ${TLS_ARGS:-/certs/tls.crt /certs/tls.key}
+    ports:
+      - "443:443"
+      # Needed for the ACME HTTP-01 challenge and the HTTP->HTTPS redirect.
+      # Safe to drop when staying on the self-signed default.
+      - "80:80"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - certs:/certs:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  # State directory volume for queue DB and jobs
+  # In production, you may want to use a bind-mount instead (path: /some/host/path)
+  # to ensure persistence and easy backup/access
+  ntlmrain-state:
+    driver: local
+
+  # The generated self-signed certificate and key, shared from cert-init to
+  # caddy. Delete this volume to force a fresh certificate.
+  certs:
+    driver: local
+
+  # Caddy's own state. Matters in Let's Encrypt mode: losing it forces a
+  # re-issue against weekly rate limits.
+  caddy-data:
+    driver: local
+
+  caddy-config:
+    driver: local

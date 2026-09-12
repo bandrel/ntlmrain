@@ -1,0 +1,153 @@
+// IndexedDB-backed persistence for GPU auto-tune results.
+//
+// Mirrors the concept of `TuningCache` in `src/gpu.rs` (a JSON file on disk,
+// keyed by an adapter fingerprint + a compile-time `shader_bundle_hash`), but
+// adapted to the browser:
+//   - WebGPU has no native-style adapter fingerprint (no PCI vendor/device
+//     IDs, no driver string), so the cache key instead combines whatever
+//     `GPUAdapterInfo` the browser is willing to disclose
+//     (`vendor` + `architecture` + `description`) with a digest of the
+//     negotiated `GPUDevice`'s relevant limits.
+//   - `shader_bundle_hash` is normally computed at Rust compile time from
+//     `include_str!`/`include_bytes!`'d shader sources; here it is computed
+//     at runtime via `SubtleCrypto.digest('SHA-256', ...)` over the actual
+//     shipped WGSL text (both precompute shader files) plus the `des_lut.bin`
+//     bytes, since there is no build-time embedding step to hook into.
+//   - `TUNING_SCHEMA` in `gpu.rs` is a Rust constant baked into the cache
+//     entry; `TUNING_CACHE_SCHEMA_VERSION` below is this file's equivalent,
+//     versioned independently since the on-disk (JSON) and IndexedDB
+//     storage formats are unrelated.
+
+import type { TuningSelection } from "./tuning";
+
+/** Bump whenever `TuningSelection`'s shape (or this file's storage schema) changes. */
+export const TUNING_CACHE_SCHEMA_VERSION = 1;
+
+const DB_NAME = "ntlmrain-tuning-cache";
+const DB_VERSION = 1;
+const STORE_NAME = "selections";
+
+export interface TuningCacheKeyInputs {
+  /** The subset of `GPUAdapterInfo` browsers actually populate without a permission prompt. */
+  adapterInfo: Pick<GPUAdapterInfo, "vendor" | "architecture" | "description">;
+  device: GPUDevice;
+  precomputeCompactSource: string;
+  precomputeExpandedSource: string;
+  falseAlarmCompactSource: string;
+  falseAlarmExpandedSource: string;
+  desLutBytes: Uint8Array;
+}
+
+interface StoredTuningCacheEntry {
+  cacheKey: string;
+  schemaVersion: number;
+  selection: TuningSelection;
+  storedAt: number;
+}
+
+/** A short, stable digest of the negotiated device's limits relevant to shader selection. */
+function limitsFingerprint(device: GPUDevice): string {
+  const limits = device.limits;
+  return [
+    limits.maxBufferSize,
+    limits.maxStorageBufferBindingSize,
+    limits.maxComputeWorkgroupStorageSize,
+    limits.maxComputeInvocationsPerWorkgroup,
+    limits.maxComputeWorkgroupSizeX,
+    limits.maxComputeWorkgroupsPerDimension,
+    limits.minStorageBufferOffsetAlignment,
+  ].join(",");
+}
+
+/**
+ * Compute the cache key: `SHA-256` over
+ * `vendor + architecture + description + limitsFingerprint + schemaVersion`
+ * (as UTF-8 text) concatenated with the actual shipped WGSL source text for
+ * both shader files plus the raw `des_lut.bin` bytes — the runtime
+ * equivalent of native's `adapter_fingerprint()` combined with
+ * `shader_bundle_hash()`.
+ */
+export async function computeTuningCacheKey(inputs: TuningCacheKeyInputs): Promise<string> {
+  const encoder = new TextEncoder();
+  const textPart = [
+    inputs.adapterInfo.vendor ?? "",
+    inputs.adapterInfo.architecture ?? "",
+    inputs.adapterInfo.description ?? "",
+    limitsFingerprint(inputs.device),
+    String(TUNING_CACHE_SCHEMA_VERSION),
+    inputs.precomputeCompactSource,
+    inputs.precomputeExpandedSource,
+    inputs.falseAlarmCompactSource,
+    inputs.falseAlarmExpandedSource,
+  ].join("\u0000");
+  const textBytes = encoder.encode(textPart);
+  const combined = new Uint8Array(textBytes.byteLength + inputs.desLutBytes.byteLength);
+  combined.set(textBytes, 0);
+  combined.set(inputs.desLutBytes, textBytes.byteLength);
+  const digest = await crypto.subtle.digest("SHA-256", combined);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function openDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: "cacheKey" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error ?? new Error("failed to open the ntlmrain tuning-cache database"));
+  });
+}
+
+/** Look up a cached tuning selection. Returns `null` on a miss or a schema-version mismatch. */
+export async function getCachedTuning(cacheKey: string): Promise<TuningSelection | null> {
+  const db = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, "readonly");
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get(cacheKey);
+      request.onsuccess = () => {
+        const entry = request.result as StoredTuningCacheEntry | undefined;
+        if (!entry || entry.schemaVersion !== TUNING_CACHE_SCHEMA_VERSION) {
+          resolve(null);
+          return;
+        }
+        resolve(entry.selection);
+      };
+      request.onerror = () =>
+        reject(request.error ?? new Error("failed to read the ntlmrain tuning-cache entry"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/** Store (or overwrite) the tuning selection for `cacheKey`. */
+export async function putCachedTuning(cacheKey: string, selection: TuningSelection): Promise<void> {
+  const db = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, "readwrite");
+      const store = transaction.objectStore(STORE_NAME);
+      const entry: StoredTuningCacheEntry = {
+        cacheKey,
+        schemaVersion: TUNING_CACHE_SCHEMA_VERSION,
+        selection,
+        storedAt: Date.now(),
+      };
+      store.put(entry);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () =>
+        reject(transaction.error ?? new Error("failed to write the ntlmrain tuning-cache entry"));
+    });
+  } finally {
+    db.close();
+  }
+}

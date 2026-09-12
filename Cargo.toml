@@ -1,3 +1,10 @@
+[workspace]
+members = ["server", "crypto-wasm"]
+
+[profile.release-server]
+inherits = "release"
+panic = "unwind"
+
 [package]
 name = "ntlmrain"
 version = "0.1.18"

@@ -1,0 +1,22 @@
+[target.wasm32-unknown-unknown]
+rustflags = [
+  # `getrandom` 0.3 (pulled in transitively via `ntlmrain`'s `rand`
+  # dependency) requires opting into its wasm-bindgen-backed browser RNG
+  # explicitly for this target; see crypto-wasm/Cargo.toml's `getrandom`
+  # dependency comment for the other half of this.
+  "--cfg", "getrandom_backend=\"wasm_js\"",
+  # crypto-wasm's serial verify port calls through
+  # `ntlmrain::bitslice::netntlmv1_bitslice_batch`'s portable `bs_des`
+  # backend, whose unrolled bitsliced-DES Feistel rounds have very large
+  # per-call stack frames in unoptimized (debug) builds. wasm32's default
+  # ~1MiB stack (there is no OS thread to give a bigger one to, and none
+  # of crypto-wasm's own code spawns one) overflows into the rest of
+  # linear memory under `wasm-pack test`'s debug-profile build, trapping
+  # with "memory access out of bounds". 16MiB matches this crate's actual
+  # working set with headroom. (Native `cargo test` hits the same
+  # underlying stack-frame-size issue but fixes it differently — see
+  # crypto-wasm/src/verify.rs's `with_big_stack` test helper, which scopes
+  # a bigger OS-thread stack to just the tests that need it instead of
+  # widening every process's stack workspace-wide.)
+  "-C", "link-args=-z stack-size=16777216",
+]

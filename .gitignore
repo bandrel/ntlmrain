@@ -1,3 +1,15 @@
 /target/
 /artifacts/
 ntlmrain.toml
+/crypto-wasm/pkg/
+/web/node_modules/
+/web/dist/
+# Copied from ../shaders/ by web/scripts/copy-shaders.mjs (predev/prebuild);
+# ../shaders/ is the source of truth, this is a build artifact.
+/web/public/shaders/
+
+# Local deployment config. Holds the real domain and, for some DNS plugins,
+# provider API credentials. .env.example is the tracked template.
+.env
+!.env.example
+

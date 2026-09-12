@@ -1,0 +1,39 @@
+[package]
+name = "ntlmrain-server"
+version = "0.1.0"
+edition = "2024"
+description = "NetNTLMv1 rainbow-table lookup service"
+license = "Apache-2.0"
+
+[dependencies]
+ntlmrain = { path = ".." }
+anyhow = "1"
+axum = "0.8"
+# Already resolved at this version in the workspace lockfile (transitive via
+# reqwest/hyper's dependency tree) -- used here to decode the
+# `Authorization: Basic <base64>` header (auth.rs), not a new dependency in
+# practice.
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+rand = "0.9"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["timeout", "catch-panic", "set-header", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+# For tests/e2e.rs's manual-protocol checks only (malformed requests the
+# CLI's own `RemoteLookupClient` won't construct); already resolved in the
+# workspace lockfile transitively via `ntlmrain`'s own `reqwest` dependency
+# (that one's `blocking` feature; this one adds the async client instead).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[[bin]]
+name = "ntlmrain-server"
+path = "src/main.rs"

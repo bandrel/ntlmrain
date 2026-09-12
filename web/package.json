@@ -1,0 +1,24 @@
+{
+  "name": "ntlmrain-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser-based WebGPU precompute UI for ntlmrain-server, backed by crypto-wasm.",
+  "scripts": {
+    "predev": "node scripts/copy-shaders.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/copy-shaders.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@webgpu/types": "^0.1.44",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^5.6.2",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.4"
+  }
+}
