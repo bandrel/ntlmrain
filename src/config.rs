@@ -15,6 +15,8 @@ pub const ENV_REMOTE_URL: &str = "NTLMRAIN_REMOTE_URL";
 pub const ENV_REMOTE_USERNAME: &str = "NTLMRAIN_REMOTE_USERNAME";
 pub const ENV_REMOTE_PASSWORD: &str = "NTLMRAIN_REMOTE_PASSWORD";
 pub const ENV_REMOTE_AUTH: &str = "NTLMRAIN_REMOTE_AUTH";
+pub const ENV_REMOTE_CA_CERT: &str = "NTLMRAIN_REMOTE_CA_CERT";
+pub const ENV_REMOTE_INSECURE: &str = "NTLMRAIN_REMOTE_INSECURE";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
@@ -28,6 +30,8 @@ impl Default for Config {
                 url: DEFAULT_REMOTE_URL.to_owned(),
                 username: None,
                 password: None,
+                ca_certificate: None,
+                insecure: false,
             },
         }
     }
@@ -46,6 +50,11 @@ pub struct RemoteConfig {
     pub url: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Extra PEM trust anchor for a lookup server whose certificate does not
+    /// chain to a public root.
+    pub ca_certificate: Option<PathBuf>,
+    /// Skip TLS verification for the lookup server.
+    pub insecure: bool,
 }
 
 impl RemoteConfig {
@@ -60,6 +69,8 @@ impl fmt::Debug for RemoteConfig {
             .field("url", &redact_url(&self.url))
             .field("username", &self.username.as_deref().map(|_| "<redacted>"))
             .field("password", &self.password.as_deref().map(|_| "<redacted>"))
+            .field("ca_certificate", &self.ca_certificate)
+            .field("insecure", &self.insecure)
             .finish()
     }
 }
@@ -72,6 +83,11 @@ pub struct ConfigOverrides {
     pub remote_username: Option<String>,
     pub remote_password: Option<String>,
     pub remote_auth: Option<bool>,
+    pub remote_ca_certificate: Option<PathBuf>,
+    /// `Some(true)` corresponds to a `--remote-insecure` flag. The flag cannot
+    /// be unset from the command line, so `None` simply leaves lower layers
+    /// alone.
+    pub remote_insecure: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +105,8 @@ pub struct RemoteFileConfig {
     pub password: Option<String>,
     /// When false, clear both credentials after applying this layer.
     pub auth: Option<bool>,
+    pub ca_certificate: Option<PathBuf>,
+    pub insecure: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -104,10 +122,14 @@ pub enum ConfigError {
     },
     #[error("{ENV_REMOTE_AUTH} must be true/false, yes/no, on/off, or 1/0")]
     InvalidAuthEnvironment,
+    #[error("{ENV_REMOTE_INSECURE} must be true/false, yes/no, on/off, or 1/0")]
+    InvalidInsecureEnvironment,
     #[error("remote URL cannot be empty")]
     EmptyRemoteUrl,
     #[error("remote authentication requires both a non-empty username and password")]
     IncompleteCredentials,
+    #[error("a remote CA certificate cannot be combined with insecure TLS")]
+    ConflictingTlsOptions,
 }
 
 impl Config {
@@ -144,7 +166,7 @@ impl Config {
     {
         let mut config = Self::default();
         if let Some(file) = file {
-            apply_file(&mut config, &file.remote);
+            apply_file(&mut config, &file.remote)?;
         }
 
         if let Some(url) = environment(ENV_REMOTE_URL) {
@@ -156,6 +178,14 @@ impl Config {
         if let Some(password) = environment(ENV_REMOTE_PASSWORD) {
             config.remote.password = Some(password);
         }
+        let environment_insecure = environment(ENV_REMOTE_INSECURE)
+            .map(|value| parse_bool(&value).ok_or(ConfigError::InvalidInsecureEnvironment))
+            .transpose()?;
+        apply_tls(
+            &mut config,
+            environment(ENV_REMOTE_CA_CERT).map(PathBuf::from).as_ref(),
+            environment_insecure,
+        )?;
         if let Some(auth) = environment(ENV_REMOTE_AUTH)
             && !parse_bool(&auth).ok_or(ConfigError::InvalidAuthEnvironment)?
         {
@@ -171,6 +201,11 @@ impl Config {
         if let Some(password) = &overrides.remote_password {
             config.remote.password = Some(password.clone());
         }
+        apply_tls(
+            &mut config,
+            overrides.remote_ca_certificate.as_ref(),
+            overrides.remote_insecure,
+        )?;
         if overrides.remote_auth == Some(false) {
             clear_auth(&mut config);
         }
@@ -181,6 +216,9 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.remote.url.trim().is_empty() {
             return Err(ConfigError::EmptyRemoteUrl);
+        }
+        if self.remote.insecure && self.remote.ca_certificate.is_some() {
+            return Err(ConfigError::ConflictingTlsOptions);
         }
         match (&self.remote.username, &self.remote.password) {
             (None, None) => Ok(()),
@@ -205,7 +243,7 @@ pub fn parse_config_file(path: &Path, contents: &str) -> Result<ConfigFile, Conf
     })
 }
 
-fn apply_file(config: &mut Config, file: &RemoteFileConfig) {
+fn apply_file(config: &mut Config, file: &RemoteFileConfig) -> Result<(), ConfigError> {
     if let Some(url) = &file.url {
         config.remote.url = url.clone();
     }
@@ -218,6 +256,32 @@ fn apply_file(config: &mut Config, file: &RemoteFileConfig) {
     if file.auth == Some(false) {
         clear_auth(config);
     }
+    apply_tls(config, file.ca_certificate.as_ref(), file.insecure)
+}
+
+/// Apply one layer's TLS settings. The two are mutually exclusive, so a layer
+/// that sets either one also clears whatever a lower layer chose -- otherwise a
+/// stale CA path in the config file would block `--remote-insecure`, and vice
+/// versa. Supplying both in the same layer is a contradiction and is rejected.
+fn apply_tls(
+    config: &mut Config,
+    ca_certificate: Option<&PathBuf>,
+    insecure: Option<bool>,
+) -> Result<(), ConfigError> {
+    if ca_certificate.is_some() && insecure == Some(true) {
+        return Err(ConfigError::ConflictingTlsOptions);
+    }
+    if let Some(path) = ca_certificate {
+        config.remote.ca_certificate = Some(path.clone());
+        config.remote.insecure = false;
+    }
+    if let Some(insecure) = insecure {
+        config.remote.insecure = insecure;
+        if insecure {
+            config.remote.ca_certificate = None;
+        }
+    }
+    Ok(())
 }
 
 fn clear_auth(config: &mut Config) {
@@ -284,6 +348,7 @@ mod tests {
             remote_username: Some("cli-user".into()),
             remote_password: Some("cli-pass".into()),
             remote_auth: None,
+            ..Default::default()
         };
         let config =
             Config::resolve(Some(&file), map_environment(&environment), &overrides).unwrap();
@@ -338,6 +403,109 @@ mod tests {
             Config::resolve(None, |_| None, &overrides),
             Err(ConfigError::IncompleteCredentials)
         ));
+    }
+
+    #[test]
+    fn tls_trust_settings_layer_like_every_other_value() {
+        let file: ConfigFile =
+            toml::from_str("[remote]\nca_certificate = \"/from-file.pem\"").unwrap();
+        let config = Config::resolve(Some(&file), |_| None, &ConfigOverrides::default()).unwrap();
+        assert_eq!(
+            config.remote.ca_certificate,
+            Some(PathBuf::from("/from-file.pem"))
+        );
+        assert!(!config.remote.insecure);
+
+        let environment = BTreeMap::from([(ENV_REMOTE_CA_CERT.into(), "/from-env.pem".into())]);
+        let overrides = ConfigOverrides {
+            remote_ca_certificate: Some(PathBuf::from("/from-cli.pem")),
+            ..Default::default()
+        };
+        let config =
+            Config::resolve(Some(&file), map_environment(&environment), &overrides).unwrap();
+        assert_eq!(
+            config.remote.ca_certificate,
+            Some(PathBuf::from("/from-cli.pem"))
+        );
+    }
+
+    #[test]
+    fn a_later_layer_can_switch_between_a_ca_and_insecure() {
+        // A CA path left in the config file must not block `--remote-insecure`.
+        let file: ConfigFile =
+            toml::from_str("[remote]\nca_certificate = \"/from-file.pem\"").unwrap();
+        let overrides = ConfigOverrides {
+            remote_insecure: Some(true),
+            ..Default::default()
+        };
+        let config = Config::resolve(Some(&file), |_| None, &overrides).unwrap();
+        assert!(config.remote.insecure);
+        assert_eq!(config.remote.ca_certificate, None);
+
+        // And the reverse: naming a CA turns verification back on.
+        let file: ConfigFile = toml::from_str("[remote]\ninsecure = true").unwrap();
+        let overrides = ConfigOverrides {
+            remote_ca_certificate: Some(PathBuf::from("/from-cli.pem")),
+            ..Default::default()
+        };
+        let config = Config::resolve(Some(&file), |_| None, &overrides).unwrap();
+        assert!(!config.remote.insecure);
+        assert_eq!(
+            config.remote.ca_certificate,
+            Some(PathBuf::from("/from-cli.pem"))
+        );
+    }
+
+    #[test]
+    fn one_layer_cannot_ask_for_both_a_ca_and_insecure() {
+        let file: ConfigFile =
+            toml::from_str("[remote]\nca_certificate = \"/ca.pem\"\ninsecure = true").unwrap();
+        assert!(matches!(
+            Config::resolve(Some(&file), |_| None, &ConfigOverrides::default()),
+            Err(ConfigError::ConflictingTlsOptions)
+        ));
+
+        let environment = BTreeMap::from([
+            (ENV_REMOTE_CA_CERT.into(), "/ca.pem".into()),
+            (ENV_REMOTE_INSECURE.into(), "true".into()),
+        ]);
+        assert!(matches!(
+            Config::resolve(
+                None,
+                map_environment(&environment),
+                &ConfigOverrides::default()
+            ),
+            Err(ConfigError::ConflictingTlsOptions)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_uninterpretable_insecure_environment_value() {
+        let environment = BTreeMap::from([(ENV_REMOTE_INSECURE.into(), "maybe".into())]);
+        assert!(matches!(
+            Config::resolve(
+                None,
+                map_environment(&environment),
+                &ConfigOverrides::default()
+            ),
+            Err(ConfigError::InvalidInsecureEnvironment)
+        ));
+    }
+
+    #[test]
+    fn debug_output_still_hides_credentials_with_tls_settings_present() {
+        let config = Config {
+            remote: RemoteConfig {
+                url: "https://user:secret@lookup.example".into(),
+                username: Some("user".into()),
+                password: Some("secret".into()),
+                ca_certificate: Some(PathBuf::from("/ca.pem")),
+                insecure: false,
+            },
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+        assert!(rendered.contains("/ca.pem"), "{rendered}");
     }
 
     #[test]
