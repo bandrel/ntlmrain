@@ -116,31 +116,42 @@ Do not attempt to bypass this or build with plain `--release`.
 The easiest way is to use the compose file:
 
 ```sh
+cp .env.example .env
+$EDITOR .env
 docker compose up
 ```
 
-Before running, edit `docker-compose.yml` to point the bind-mount at the
-directory holding your shards (replace `/path/to/tables` with the real
-path) and set `NTLMRAIN_SERVER_DATA_BASE` and `NTLMRAIN_SERVER_INDEX` to
-match. The host side of the mount is the **directory containing** the
+All configuration lives in `.env`; `docker-compose.yml` needs no edits for
+a normal deployment. Three settings are required, and the rest of
+`.env.example` documents the optional ones.
+
+Point `TABLES_DIR` at the directory holding your shards, then set
+`NTLMRAIN_SERVER_DATA_BASE` and `NTLMRAIN_SERVER_INDEX` to match, as paths
+*inside* the container — that directory is bind-mounted read-only at
+`/data`. The host side of the mount is the **directory containing** the
 shards, not the table itself; as described under [Running](#running),
 there is no single table file to point at.
 
 For example, for shards named
 `/srv/tables/netntlmv1_byte#7-7_0_881689x134217668.0000.grtb` and up:
 
-```yaml
-volumes:
-  - /srv/tables:/data:ro
-
-environment:
-  NTLMRAIN_SERVER_DATA_BASE: "/data/netntlmv1_byte#7-7_0_881689x134217668"
-  NTLMRAIN_SERVER_INDEX: "/data/netntlmv1_byte#7-7_0_881689x134217668.gidx"
+```sh
+TABLES_DIR=/srv/tables
+NTLMRAIN_SERVER_DATA_BASE=/data/netntlmv1_byte#7-7_0_881689x134217668
+NTLMRAIN_SERVER_INDEX=/data/netntlmv1_byte#7-7_0_881689x134217668.gidx
 ```
 
-A `#` in the middle of a word is part of the value rather than the start
-of a YAML comment, so quoting is only strictly required when a table name
-contains a space.
+A `#` only starts a comment in this file when it follows whitespace, so a
+table name containing one needs no quoting or escaping. Quote only when
+the name contains a space.
+
+Leave an optional setting commented out to accept its default rather than
+setting it to an empty value. The server parses its config with clap,
+which treats an empty string as a value that *was* supplied, so
+`NTLMRAIN_SERVER_READ_WORKERS=` is a parse error rather than "unset".
+
+Forgetting `TABLES_DIR` fails immediately, at compose-parse time, with a
+message naming the variable — the bind-mount guards on it.
 
 The container drops to uid 1000, so the shards and the `.gidx` must be
 readable by that uid or world-readable. A root-owned `0600` table

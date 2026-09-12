@@ -30,65 +30,47 @@ services:
     # Then configure your reverse proxy to reach this service by its container
     # name or service name on that network (e.g., "ntlmrain-server:8080").
 
+    # Every server setting lives in .env -- copy .env.example to .env and edit
+    # it there. Nothing in this file needs changing for a normal deployment.
+    #
+    # env_file is used rather than "${VAR}" interpolation on purpose. The
+    # server parses its config with clap, which treats an empty string as a
+    # value that was supplied: NTLMRAIN_SERVER_READ_WORKERS="" is a parse
+    # error, and NTLMRAIN_SERVER_AUTH_USER="" reads as "auth is configured"
+    # and then fails for want of a password. Interpolating an unset optional
+    # would hand clap exactly that empty string; a key simply absent from
+    # .env stays absent from the container environment, which is what the
+    # defaults in config.rs expect.
+    #
+    # required: false keeps "docker compose build" and "config" working
+    # before a .env exists. Running without one still fails loudly -- see the
+    # TABLES_DIR guard on the bind-mount below.
+    env_file:
+      - path: .env
+        required: false
+
     environment:
-      # Required: GRTB table shards base path (inside container).
-      #
-      # This is a filename PREFIX, not a directory and not a file that exists
-      # on disk. The server appends a shard suffix to it, so a base path of
-      # /data/mytable is opened as /data/mytable.0000.grtb, .0001.grtb, and so
-      # on. Take the prefix your shards share, drop the ".NNNN.grtb" tail, and
-      # rewrite the host directory to wherever you bind-mount it below.
-      #
-      # Quoting matters only if your table name contains a space; a "#" in the
-      # middle of a word is part of the value, not a YAML comment.
-      NTLMRAIN_SERVER_DATA_BASE: "/data/netntlmv1_byte#7-7_0_881689x134217668"
-
-      # Required: GIDX index file path (inside container). Unlike the base path
-      # above, this is a real file: the shard prefix plus ".gidx".
-      NTLMRAIN_SERVER_INDEX: "/data/netntlmv1_byte#7-7_0_881689x134217668.gidx"
-
-      # Required: directory for SQLite queue DB and jobs blob tree
-      # Must be writable; should be on a separate volume from table data
+      # Required: directory for SQLite queue DB and jobs blob tree. Pinned
+      # here rather than in .env because it has to agree with the /state
+      # volume mount below -- the two are a pair, and a .env that disagreed
+      # would write the queue DB into the container's ephemeral layer.
+      # Compose gives "environment" precedence over "env_file", so setting
+      # NTLMRAIN_SERVER_STATE_DIR in .env has no effect.
       NTLMRAIN_SERVER_STATE_DIR: /state
-
-      # Optional: directory of static web assets served at /.
-      # The image already builds the browser UI and bakes this in, so the
-      # service comes up with a working UI at http://<host>:8080/ and needs
-      # no setting here. Override only to serve a different bundle, e.g. a
-      # bind-mounted web/dist you are iterating on.
-      # NTLMRAIN_SERVER_STATIC_DIR: /usr/share/ntlmrain/web
-
-      # Optional: concurrent table-read workers (default: system CPU count)
-      # NTLMRAIN_SERVER_READ_WORKERS: 4
-
-      # Optional: preload the GIDX index into memory at startup
-      # NTLMRAIN_SERVER_PRELOAD_INDEX: "true"
-
-      # Optional: lock the index into memory (mlock) to prevent swapping
-      # NTLMRAIN_SERVER_LOCK_INDEX: "true"
-
-      # Optional: number of concurrent lookup slots (default: 2)
-      # NTLMRAIN_SERVER_LOOKUP_SLOTS: 4
-
-      # Optional: HTTP Basic auth (requires both username and password source)
-      # Uncomment both lines and set your own values; password can be set via
-      # NTLMRAIN_SERVER_AUTH_PASSWORD (env only, not a CLI flag) or
-      # NTLMRAIN_SERVER_AUTH_PASSWORD_FILE (path to file with password).
-      # When auth is configured, /api/v1/submissions* routes require credentials;
-      # /health/*, /openapi.json, /docs remain unauthenticated.
-      #
-      # NTLMRAIN_SERVER_AUTH_USER: "admin"
-      # NTLMRAIN_SERVER_AUTH_PASSWORD_FILE: "/run/secrets/ntlmrain_password"
 
     volumes:
       # Read-only bind-mount of table data (GRTB shards + GIDX index).
       #
       # The host side is the DIRECTORY CONTAINING the shards, not the table
-      # itself -- there is no single file to point at. Replace /path/to/tables
-      # with that directory. The shards and the .gidx inside it must be
+      # itself -- there is no single file to point at. Set TABLES_DIR in .env
+      # to that directory. The shards and the .gidx inside it must be
       # readable by uid 1000, which is the unprivileged user the container
       # drops to; a root-owned 0600 table mounts cleanly and then fails to open.
-      - /path/to/tables:/data:ro
+      #
+      # The ":?" makes a missing TABLES_DIR fail at compose-parse time with
+      # this message, instead of silently mounting nothing and surfacing as a
+      # table-open error minutes later.
+      - ${TABLES_DIR:?set TABLES_DIR in .env to the host directory holding your GRTB shards (copy .env.example to .env)}:/data:ro
 
       # Read-write volume/bind-mount for SQLite queue DB and jobs directory
       # This must NOT be read-only and should NOT share the mount with table data
