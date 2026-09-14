@@ -25,6 +25,7 @@ import {
 import { validateInput } from "./ui/validation";
 import { recoveredKeysFromIndices } from "./ui/key-format";
 import { RunController, type RunSnapshot } from "./ui/run-controller";
+import { installGlobalErrorReporter, type ErrorEventTarget } from "./ui/global-errors";
 import { ProgressView, renderArchiveDetail, renderArchiveList, renderInputFeedback, renderResults } from "./ui/view";
 import {
   generateRunId,
@@ -435,6 +436,16 @@ async function startRun(): Promise<void> {
   await putRun(record);
   await refreshArchiveList();
 }
+
+// Catch-all for failures that never reach `RunController`'s own handler.
+// Reuses the input feedback line rather than adding a second error surface,
+// and re-enables the start button so a run killed by a stray rejection can
+// actually be retried instead of leaving the UI wedged mid-run.
+// The cast bridges the DOM's `EventListener` signature (which types every
+// event as the base `Event`) to the narrowing this module does itself.
+installGlobalErrorReporter(window as unknown as ErrorEventTarget, (message) => {
+  reportGpuSettingsError(message);
+});
 
 refreshValidation();
 void refreshArchiveList();
