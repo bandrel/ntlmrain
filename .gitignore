@@ -13,3 +13,7 @@ ntlmrain.toml
 .env
 !.env.example
 
+# Console logs, page snapshots and screenshots dropped by the Playwright MCP
+# browser tooling while poking at the web UI. Disposable session artifacts.
+/.playwright-mcp/
+
