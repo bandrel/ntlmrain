@@ -263,3 +263,65 @@ describe("cancel", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
+
+// `remote_lookup.rs` gives its reqwest client a whole-request
+// `request_timeout` (30 minutes by default), so a lookup service that
+// accepts a connection and then goes quiet fails instead of hanging. The
+// browser port had no equivalent: every fetch ran unbounded, and a stalled
+// poll or download left the UI showing a stage that would never advance.
+describe("request timeouts", () => {
+  it("aborts a request that outlives the configured timeout and reports it as a timeout", async () => {
+    // Never settles on its own, and never observes the signal either: only
+    // the client's own abort can end this.
+    const fetchImpl = vi.fn(
+      (_url: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(status(config(fetchImpl, { requestTimeoutMs: 10 }), "a".repeat(64), 1)).rejects.toThrow(
+      /timed out/i,
+    );
+  });
+
+  it("passes an abort signal on every request", async () => {
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      return jsonResponse({ submission_token: "a".repeat(64), poll_within_seconds: 4 });
+    }) as unknown as typeof fetch;
+
+    await submit(config(fetchImpl), new Uint8Array([1]));
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  // The timer has to outlive the headers and cover the body read: `result`
+  // streams the whole NTLMCAN1 payload after `doFetch` resolves, which is
+  // exactly the leg most likely to stall on a large download.
+  it("still times out when the headers arrive promptly but the body stalls", async () => {
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1]));
+          init?.signal?.addEventListener("abort", () => controller.error(init.signal?.reason));
+          // Never closes: the rest of the body never arrives.
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await expect(result(config(fetchImpl, { requestTimeoutMs: 10 }), "a".repeat(64))).rejects.toThrow(/timed out/i);
+  });
+
+  // 200 polls over a seven-minute lookup must not leave 200 live 30-minute
+  // timers behind.
+  it("clears its timer once a request completes", async () => {
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+    const fetchImpl = vi.fn(async () => jsonResponse({ submission_token: "a".repeat(64) })) as unknown as typeof fetch;
+
+    await submit(config(fetchImpl), new Uint8Array([1]));
+
+    expect(clearSpy).toHaveBeenCalled();
+    clearSpy.mockRestore();
+  });
+});

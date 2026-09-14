@@ -25,7 +25,23 @@ export interface LookupClientConfig {
   password?: string;
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
+  /**
+   * Whole-request deadline in milliseconds, covering the body read as well
+   * as the headers. Port of `RemoteLookupConfig::request_timeout`, and like
+   * reqwest's `Client::timeout` it bounds the entire exchange rather than
+   * just the connect. Defaults to `DEFAULT_REQUEST_TIMEOUT_MS`.
+   */
+  requestTimeoutMs?: number;
 }
+
+/**
+ * 30 minutes, matching `RemoteLookupConfig::default`'s
+ * `Duration::from_secs(30 * 60)`. Generous on purpose: a submission uploads
+ * an endpoint file with hundreds of thousands of records and the result
+ * download can be comparably large, so this is a "the service has gone
+ * away" backstop, not a latency budget.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 
 export interface SubmissionReceipt {
   submissionToken: string;
@@ -80,16 +96,20 @@ function validateSubmissionToken(token: string): void {
  * `Content-Type: application/vnd.netntlmv1.endpoints`.
  */
 export async function submit(config: LookupClientConfig, endpointBytes: Uint8Array): Promise<SubmissionReceipt> {
-  const response = await doFetch(config, "/api/v1/submissions", {
-    method: "POST",
-    headers: { "Content-Type": "application/vnd.netntlmv1.endpoints" },
-    // `new Uint8Array(endpointBytes)` guarantees a plain `ArrayBuffer`-backed
-    // view (not `ArrayBufferLike`/`SharedArrayBuffer`), which is what
-    // `BodyInit`'s `ArrayBufferView` constraint requires under this
-    // TypeScript version's DOM lib typings.
-    body: new Uint8Array(endpointBytes),
-  });
-  const json = (await response.json()) as Record<string, unknown>;
+  const json = (await doFetch(
+    config,
+    "/api/v1/submissions",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.netntlmv1.endpoints" },
+      // `new Uint8Array(endpointBytes)` guarantees a plain `ArrayBuffer`-backed
+      // view (not `ArrayBufferLike`/`SharedArrayBuffer`), which is what
+      // `BodyInit`'s `ArrayBufferView` constraint requires under this
+      // TypeScript version's DOM lib typings.
+      body: new Uint8Array(endpointBytes),
+    },
+    (response) => response.json(),
+  )) as Record<string, unknown>;
   if (typeof json.submission_token !== "string") {
     throw new LookupServiceError("lookup service response is missing submission_token");
   }
@@ -116,12 +136,16 @@ export async function status(
   submissionToken: string,
   expectedRecordCount: number,
 ): Promise<StatusResponse> {
-  const response = await doFetch(config, "/api/v1/submissions/status", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ submission_token: submissionToken }),
-  });
-  const json = (await response.json()) as Record<string, unknown>;
+  const json = (await doFetch(
+    config,
+    "/api/v1/submissions/status",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ submission_token: submissionToken }),
+    },
+    (response) => response.json(),
+  )) as Record<string, unknown>;
   return validateStatus(json, expectedRecordCount);
 }
 
@@ -195,12 +219,16 @@ export async function pollUntilReady(
 
 /** `POST {base}/api/v1/submissions/result`: returns raw NTLMCAN1 bytes. */
 export async function result(config: LookupClientConfig, submissionToken: string): Promise<Uint8Array> {
-  const response = await doFetch(config, "/api/v1/submissions/result", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ submission_token: submissionToken }),
-  });
-  return new Uint8Array(await response.arrayBuffer());
+  return doFetch(
+    config,
+    "/api/v1/submissions/result",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ submission_token: submissionToken }),
+    },
+    async (response) => new Uint8Array(await response.arrayBuffer()),
+  );
 }
 
 /**
@@ -211,11 +239,18 @@ export async function result(config: LookupClientConfig, submissionToken: string
 export async function cancel(config: LookupClientConfig, submissionToken: string): Promise<void> {
   try {
     validateSubmissionToken(submissionToken);
-    await doFetch(config, "/api/v1/submissions/cancel", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ submission_token: submissionToken }),
-    });
+    await doFetch(
+      config,
+      "/api/v1/submissions/cancel",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ submission_token: submissionToken }),
+      },
+      // Body is irrelevant, but it still has to be drained inside the guarded
+      // window rather than left dangling on an aborted-at-timeout request.
+      async (response) => void (await response.arrayBuffer()),
+    );
   } catch {
     // Best-effort: swallow every failure.
   }
@@ -229,14 +264,53 @@ function joinUrl(baseUrl: string, path: string): string {
   return `${baseUrl.replace(/\/+$/, "")}${path}`;
 }
 
-async function doFetch(config: LookupClientConfig, path: string, init: RequestInit): Promise<Response> {
+/**
+ * Port of reqwest's whole-request `timeout`. `read` consumes the body while
+ * the abort controller is still armed — `result` streams a multi-megabyte
+ * NTLMCAN1 payload after the headers land, and that leg is the one most
+ * likely to stall, so returning the `Response` and clearing the timer here
+ * would leave the download unguarded.
+ *
+ * The timer is always cleared: a seven-minute lookup polls ~200 times, and
+ * a leaked 30-minute timer per request would pile up for the life of the
+ * page.
+ */
+async function doFetch<T>(
+  config: LookupClientConfig,
+  path: string,
+  init: RequestInit,
+  read: (response: Response) => Promise<T>,
+): Promise<T> {
   const fetchImpl = config.fetchImpl ?? fetch;
   const headers = new Headers(init.headers);
   if (config.username !== undefined) {
     headers.set("Authorization", `Basic ${base64Encode(`${config.username}:${config.password ?? ""}`)}`);
   }
-  const response = await fetchImpl(joinUrl(config.baseUrl, path), { ...init, headers });
-  return requireSuccess(response);
+  const timeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  // Distinguishes our own deadline from a caller-supplied abort or a network
+  // error that merely looks like one, so only a real timeout is reported as
+  // one (native: `error.is_timeout()`).
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const response = await fetchImpl(joinUrl(config.baseUrl, path), {
+      ...init,
+      headers,
+      signal: controller.signal,
+    });
+    return await read(await requireSuccess(response));
+  } catch (error) {
+    if (timedOut) {
+      throw new LookupServiceError(`lookup request timed out after ${Math.round(timeoutMs / 1000)}s: ${path}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
