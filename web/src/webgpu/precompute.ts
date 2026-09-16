@@ -37,7 +37,30 @@ export const DES_LUT_BYTES = 102_016;
 // Native uses 1_800ms; the browser defaults lower because a blocking
 // `await buffer.mapAsync()` for that long risks the tab looking hung.
 // Exposed as a parameter so a later manual-override UI can raise it.
-export const DEFAULT_BUDGET_MS = 800;
+export const DEFAULT_BUDGET_MS = 250;
+
+/**
+ * Hard ceiling on how much wall-clock work one dispatch may target.
+ *
+ * A browser WebGPU compute dispatch that runs too long gets its command
+ * buffer dropped by the platform — on macOS/Metal the marker readback then
+ * comes back as the cleared value and `validateMarkers` fails the run. The
+ * step budget alone does not bound this, because `AdaptiveStepScheduler`
+ * converts a *measured rate* into a step target: on a fast adapter the same
+ * 800ms budget that was safe elsewhere schedules an 800ms dispatch, and
+ * `MAX_TARGET_STEPS` (a raw step count, not a duration) is far too high to
+ * act as a backstop.
+ *
+ * Observed on an Apple M2 Max at ~1.71B DES steps/s:
+ *   - fixed 128M steps (~75ms/dispatch)  — completes a full run
+ *   - adaptive 800ms  => ~1.37B steps    — dispatch dropped mid-run
+ *
+ * 250ms sits well inside the known-good end of that bracket while keeping
+ * per-dispatch overhead (one `mapAsync` round trip, ~1ms) negligible. The
+ * exact platform threshold is somewhere in (75ms, 800ms] and has not been
+ * measured; raise this only with evidence from the slowest adapter in play.
+ */
+export const MAX_DISPATCH_BUDGET_MS = 250;
 
 // Same initial guess native seeds `target_steps` with before the first
 // measured rate is available (`precompute_with_progress`'s `let mut
@@ -240,12 +263,19 @@ export function slicedDispatchWidth(
 export class AdaptiveStepScheduler {
   private smoothedRate: number | null = null;
   private targetSteps: number;
+  private readonly budgetMs: number;
 
-  constructor(
-    private readonly budgetMs: number = DEFAULT_BUDGET_MS,
-    initialTargetSteps: number = INITIAL_TARGET_STEPS,
-  ) {
+  constructor(budgetMs: number = DEFAULT_BUDGET_MS, initialTargetSteps: number = INITIAL_TARGET_STEPS) {
+    // Clamped here rather than at the call sites so every adaptive dispatch
+    // is bounded by `MAX_DISPATCH_BUDGET_MS` no matter who supplied the
+    // budget — see that constant for why an over-long dispatch is fatal.
+    this.budgetMs = clamp(budgetMs, 1, MAX_DISPATCH_BUDGET_MS);
     this.targetSteps = clamp(initialTargetSteps, MIN_TARGET_STEPS, MAX_TARGET_STEPS);
+  }
+
+  /** The budget actually in force, after the `MAX_DISPATCH_BUDGET_MS` clamp. */
+  get effectiveBudgetMs(): number {
+    return this.budgetMs;
   }
 
   get currentTargetSteps(): number {
@@ -266,7 +296,15 @@ export class AdaptiveStepScheduler {
         : this.smoothedRate * (1 - ADAPTIVE_ALPHA) + measured * ADAPTIVE_ALPHA;
     this.smoothedRate = rate;
     const desired = Math.floor((rate * this.budgetMs) / 1000);
-    this.targetSteps = clamp(desired, MIN_TARGET_STEPS, MAX_TARGET_STEPS);
+    // No `MIN_TARGET_STEPS` floor here, deliberately. `desired` is already
+    // "one budget's worth of work", so on an adapter slower than
+    // MIN_TARGET_STEPS/budgetSeconds (~256M steps/s at the default budget)
+    // that floor would *raise* the target past the duration ceiling and
+    // reintroduce the dropped-dispatch failure on slow hardware. The
+    // ceiling is a correctness bound; the floor was only an efficiency
+    // heuristic, and it is redundant once the budget is a duration. The
+    // floor still applies to the pre-measurement seed in the constructor.
+    this.targetSteps = Math.max(Math.min(desired, MAX_TARGET_STEPS), 1);
     return this.targetSteps;
   }
 }
@@ -282,14 +320,31 @@ function clamp(value: number, lo: number, hi: number): number {
 // dispatch failure, not something to skip past silently.
 // ---------------------------------------------------------------------------
 
-export function validateMarkers(markerWords: Uint32Array, groups: number): void {
+/**
+ * Shape of the dispatch being validated. Purely diagnostic: a dropped
+ * dispatch reports as a cleared marker with no other signal, so without the
+ * size and duration there is nothing in the error to distinguish "too much
+ * work in one submit" from a genuine shader fault.
+ */
+export interface DispatchContext {
+  batchSteps: number;
+  elapsedMs: number;
+  targetSteps: number;
+}
+
+export function validateMarkers(markerWords: Uint32Array, groups: number, context?: DispatchContext): void {
   for (let index = 0; index < groups; index += 1) {
     const marker = markerWords[index];
     if (marker !== COMPLETION_MAGIC) {
       const hex = marker === undefined ? "undefined" : `0x${marker.toString(16).padStart(8, "0")}`;
+      const cleared = marker === 0 ? " — the whole dispatch appears to have been dropped" : "";
+      const shape = context
+        ? ` [dispatch: ${groups} workgroups, ${context.batchSteps} steps ` +
+          `(target ${context.targetSteps}), ${context.elapsedMs.toFixed(1)}ms]`
+        : "";
       throw new Error(
         `GPU precompute dispatch did not publish a completion marker for workgroup ${index} ` +
-          `(expected 0x${COMPLETION_MAGIC.toString(16).padStart(8, "0")}, got ${hex})`,
+          `(expected 0x${COMPLETION_MAGIC.toString(16).padStart(8, "0")}, got ${hex})${cleared}${shape}`,
       );
     }
   }
@@ -593,7 +648,11 @@ export async function runPrecompute(
       markerReadback.unmap();
       const elapsedMs = performance.now() - started;
 
-      validateMarkers(markerData, groups);
+      validateMarkers(markerData, groups, {
+        batchSteps,
+        elapsedMs,
+        targetSteps,
+      });
 
       if (fixedTargetSteps === undefined) {
         scheduler.recordBatch(batchSteps, elapsedMs);

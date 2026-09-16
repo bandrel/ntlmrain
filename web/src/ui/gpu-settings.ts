@@ -3,7 +3,7 @@
 // `webgpu/precompute.ts` (Task 3/4) actually accept, so this is unit
 // testable without a real adapter.
 
-import type { ShaderVariant } from "../webgpu/precompute";
+import { DEFAULT_BUDGET_MS, MAX_DISPATCH_BUDGET_MS, type ShaderVariant } from "../webgpu/precompute";
 import type { AutoTuneOptions, TuningKey } from "../webgpu/tuning";
 
 export type ShaderChoice = "auto" | ShaderVariant;
@@ -21,7 +21,10 @@ export const FIXED_STEP_OPTIONS = [
 export const WORKGROUP_SIZE_OPTIONS = [32, 64, 128, 256, 512, 1_024] as const;
 
 /** `webgpu/precompute.ts::DEFAULT_BUDGET_MS` expressed in the seconds unit this panel exposes. */
-export const DEFAULT_ADAPTIVE_TARGET_SECONDS = 0.8;
+export const DEFAULT_ADAPTIVE_TARGET_SECONDS = DEFAULT_BUDGET_MS / 1000;
+
+/** `webgpu/precompute.ts::MAX_DISPATCH_BUDGET_MS` in this panel's seconds unit. */
+export const MAX_ADAPTIVE_TARGET_SECONDS = MAX_DISPATCH_BUDGET_MS / 1000;
 
 export interface GpuSettingsState {
   shader: ShaderChoice;
@@ -84,9 +87,18 @@ export function hasManualTuningOverride(settings: GpuSettingsState): boolean {
   return settings.shader !== "auto" || settings.workgroupSize !== "auto";
 }
 
-/** `adaptiveTargetSeconds` converted to the millisecond unit `PrecomputeOptions.budgetMs` expects. */
+/**
+ * `adaptiveTargetSeconds` converted to the millisecond unit
+ * `PrecomputeOptions.budgetMs` expects, capped at `MAX_DISPATCH_BUDGET_MS`.
+ *
+ * `AdaptiveStepScheduler` clamps this again — that is the authoritative
+ * guard. Capping here too keeps the number the panel reports equal to the
+ * one that actually runs, rather than showing a target the scheduler will
+ * silently ignore.
+ */
 export function adaptiveBudgetMs(settings: GpuSettingsState): number {
-  return Math.max(Math.round(settings.adaptiveTargetSeconds * 1000), 1);
+  const requested = Math.max(Math.round(settings.adaptiveTargetSeconds * 1000), 1);
+  return Math.min(requested, MAX_DISPATCH_BUDGET_MS);
 }
 
 export function keysEqual(a: TuningKey, b: TuningKey): boolean {

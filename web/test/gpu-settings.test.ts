@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { MAX_DISPATCH_BUDGET_MS } from "../src/webgpu/precompute";
 import {
   DEFAULT_ADAPTIVE_TARGET_SECONDS,
+  MAX_ADAPTIVE_TARGET_SECONDS,
   FIXED_STEP_OPTIONS,
   WORKGROUP_SIZE_OPTIONS,
   adaptiveBudgetMs,
@@ -11,7 +13,7 @@ import {
 } from "../src/ui/gpu-settings";
 
 describe("gpu-settings.ts", () => {
-  it("defaults to auto shader/workgroup, adaptive dispatch at 0.8s, high-performance power preference", () => {
+  it("defaults to auto shader/workgroup, adaptive dispatch at 0.25s, high-performance power preference", () => {
     const settings = defaultGpuSettings();
     expect(settings.shader).toBe("auto");
     expect(settings.workgroupSize).toBe("auto");
@@ -72,8 +74,25 @@ describe("gpu-settings.ts", () => {
   });
 
   it("adaptiveBudgetMs converts seconds to a rounded millisecond budget, never below 1", () => {
-    expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 0.8 })).toBe(800);
-    expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 1.8 })).toBe(1800);
+    expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 0.1 })).toBe(100);
+    expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 0.25 })).toBe(250);
     expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 0 })).toBe(1);
+  });
+
+  it("adaptiveBudgetMs caps an over-long target at MAX_DISPATCH_BUDGET_MS", () => {
+    // A dispatch this long gets dropped by the platform (Apple M2 Max /
+    // Metal). The panel must report the budget that will actually run, not
+    // the one the scheduler is about to clamp away.
+    expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 0.8 })).toBe(
+      MAX_DISPATCH_BUDGET_MS,
+    );
+    expect(adaptiveBudgetMs({ ...defaultGpuSettings(), adaptiveTargetSeconds: 1.8 })).toBe(
+      MAX_DISPATCH_BUDGET_MS,
+    );
+  });
+
+  it("defaults the adaptive target to a value inside the cap", () => {
+    expect(adaptiveBudgetMs(defaultGpuSettings())).toBeLessThanOrEqual(MAX_DISPATCH_BUDGET_MS);
+    expect(DEFAULT_ADAPTIVE_TARGET_SECONDS).toBeLessThanOrEqual(MAX_ADAPTIVE_TARGET_SECONDS);
   });
 });
