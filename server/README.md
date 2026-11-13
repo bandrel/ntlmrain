@@ -250,7 +250,11 @@ every request through the proxy gets a `502`.
 The trap is stopping it during that silent window. In one real incident,
 the stack was started in the foreground with `docker compose up` and
 interrupted with Ctrl-C about 18 seconds in, twice. The table was still
-loading both times, so the browser only ever saw a `502`. `docker ps -a`
+loading both times, so the browser only ever saw a `502`. Left alone, that
+same server (4,096 shards, a 3.9 GB `.gidx`, local ext4 disk) printed its
+listening line 21 seconds after the container started, so both stops came
+only seconds early. Expect the time to vary with storage speed and with
+how much of the table is already in the page cache. `docker ps -a`
 then showed:
 
 ```text
