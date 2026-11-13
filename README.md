@@ -84,7 +84,7 @@ cargo build --release
 The resulting executable is `target/release/ntlmrain` (`ntlmrain.exe` on
 Windows). Shader sources and the DES LUT are embedded in the executable.
 
-A browser-based WebGPU web UI is also available, served by `ntlmrain-server`'s `--static-dir` flag; see `web/README.md` for the build steps.
+A browser-based WebGPU web UI is also available, served by `ntlmrain-server`'s `--static-dir` flag; see `web/README.md` for the build steps. To self-host the server (Docker, TLS, and troubleshooting a `502` from the proxy), see [`server/README.md`](server/README.md#running-in-docker).
 
 ## Performance
 
