@@ -228,3 +228,82 @@ of:
 - `NTLMRAIN_SERVER_AUTH_PASSWORD` (password directly, via environment only)
 
 See the `docker-compose.yml` comments for examples.
+
+### Troubleshooting: 502 Bad Gateway from the proxy
+
+A `502` from Caddy means the proxy is up but nothing answered on
+`ntlmrain-server:8080`. The Caddy log shows it as:
+
+```text
+"msg":"dial tcp 172.18.0.2:8080: connect: connection refused" ... "status":502
+```
+
+The usual cause is a server that is still starting, not one that crashed.
+`ntlmrain-server` opens the whole table (every GRTB shard, plus the mmapped
+GIDX index) *before* it binds the listener, so a service that can't answer
+`/health/ready` truthfully never accepts connections. It prints nothing
+while it does this. A full-size table means thousands of shards and a
+multi-gigabyte `.gidx`, and opening that takes long enough to look like a
+hang. Until the server prints `ntlmrain-server: listening on 0.0.0.0:8080`,
+every request through the proxy gets a `502`.
+
+The trap is stopping it during that silent window. In one real incident,
+the stack was started in the foreground with `docker compose up` and
+interrupted with Ctrl-C about 18 seconds in, twice. The table was still
+loading both times, so the browser only ever saw a `502`. `docker ps -a`
+then showed:
+
+```text
+ntlmrain-ntlmrain-server-1   Exited (137)
+ntlmrain-caddy-1             Exited (0)
+```
+
+Exit `137` is SIGKILL. Here it came from the stop, not from the kernel's OOM
+killer. Check before assuming a crash:
+
+```sh
+docker inspect -f '{{.State.OOMKilled}} {{.State.StartedAt}} {{.State.FinishedAt}}' ntlmrain-ntlmrain-server-1
+docker events --since 30m --until 0s \
+  --filter label=com.docker.compose.project=ntlmrain \
+  --format '{{.Time}} {{.Action}} {{.Actor.Attributes.name}}'
+```
+
+`OOMKilled=false` together with `kill` events just before the `die` events
+means something stopped the stack on purpose (Ctrl-C, `docker compose stop`,
+or `down`). `attach` events at startup point to a foreground `docker compose up`.
+
+#### Fix
+
+Start the stack detached, then wait for the listening line instead of
+judging it by the browser:
+
+```sh
+docker compose up -d --build
+docker compose logs -f ntlmrain-server   # wait for "listening on 0.0.0.0:8080"
+curl -sk https://localhost/health/ready  # 200 with TableInfo once the table is open
+```
+
+Notes:
+
+- `--build` matters after a `git pull`. Plain `docker compose up` reuses
+  whatever image was built last, which can be months behind the checked-out
+  source. Check the image's age with
+  `docker image inspect -f '{{.Created}}' ntlmrain-ntlmrain-server`.
+- Docker reports the container as `unhealthy` during a long table load.
+  That's expected: the image's healthcheck (`/health/live`, 5-second start
+  period) can't pass until the listener is bound. `unhealthy` by itself
+  doesn't restart the container, so leave it alone.
+- On a host where your user isn't in the `docker` group, prefix every
+  command with `sudo`.
+
+If the server exits on its own instead (status `Exited (1)`), the reason is
+in its log, since startup failures are printed before exit:
+
+```sh
+docker compose logs ntlmrain-server
+```
+
+Common ones are `startup failed: failed to open local lookup table`, caused
+by a wrong `NTLMRAIN_SERVER_DATA_BASE`/`NTLMRAIN_SERVER_INDEX`, shards not
+readable by uid 1000 (see [Running the container](#running-the-container)),
+or a `nofile` limit below the shard count.
